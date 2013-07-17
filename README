@@ -1,0 +1,55 @@
+Nginx Upstream Ketama-based Consistent Replicated Balancer
+--
+
+Description:
+--
+
+This module uses ketama algorithm to consistently hash requested URI's to backend servers (given that list of servers don't changes).
+Ketama was originally developed for mapping keys to servers in memcache pool.
+It's explanation could be found here: http://www.lastfm.ru/user/RJ/journal/2007/04/10/rz_libketama_-_a_consistent_hashing_algo_for_memcache_clients
+
+There already exists the module that uses ketama exactly for memcache upstreams: https://github.com/dctrwatson/nginx-upstream-consistent
+Using it you could be sure that your backends and Nginx maps keys in the same way.
+
+Key difference from that module is that each URI hashes to few backends (hashing to 1 backend is possible, in that case it will be compatible with memcached implementation).
+Each time URI is requested it will be mapped to the same backends (again given that list of servers don't changes).
+Mapping to few backends may be useful for example for distributed replicated file storages.
+
+Since Nginx upstream modules can't return few selected backends (which could then be used in something like try_files) this module chooses one of mapped backends randomly.
+
+
+Installation:
+--
+
+You'll need to re-compile Nginx from source to include this module.
+Modify your compile of Nginx by adding the following directive
+(modified to suit your path of course):
+
+./configure --with-http_ssl_module --add-module=/absolute/path/to/nginx-upstream-consistent-replicated
+make
+make install
+
+
+Usage:
+--
+
+Change your Nginx config file upstream block to include the 'consistent_replicated' directive:
+
+upstream backend {
+    consistent_replicated;
+    server 192.168.0.2:9000;
+    server 192.168.0.3:9000;
+    server 192.168.0.4:9000;
+}
+
+Also it may accept parameters ketama_points, weight_scale and replication_level.
+By default they are respectively 150, 10 and 1 and thus should be compatible with Perl Cache::Memcached::Fast module.
+
+upstream backend {
+    consistent_replicated ketama_points=150 weight_scale=10 replication_level=1;
+    server 192.168.0.2:9000;
+    server 192.168.0.3:9000;
+    server 192.168.0.4:9000;
+}
+
+
