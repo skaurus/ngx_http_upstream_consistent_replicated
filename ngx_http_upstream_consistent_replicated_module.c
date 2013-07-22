@@ -67,17 +67,22 @@ ngx_module_t ngx_http_upstream_consistent_replicated_module = {
 };
 
 
+// max possible unsigned int stored in 32bits
+// U is not valid in hex numbers and means that number is unsigned
+#define CONTINUUM_MAX_POINT  0xffffffffU
+
+
 typedef struct {
     struct sockaddr                *sockaddr;
     socklen_t                       socklen;
     ngx_str_t                       name;
-} ngx_http_upstream_consistent_replicated_hash_peer_t;
+} ngx_http_upstream_consistent_replicated_peer_addr_t;
 
 typedef struct {
     ngx_uint_t                                              ketama_points;
     ngx_uint_t                                              replication_level;
     ngx_uint_t                                              peers_count;
-    ngx_http_upstream_consistent_replicated_hash_peer_t     *peers;
+    ngx_http_upstream_consistent_replicated_peer_addr_t     *peers;
 } upstream_consistent_replicated_config_t;
 
 
@@ -86,14 +91,17 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
 static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *ussv);
 
 
-// http://www.evanmiller.org/nginx-modules-guide.html#lb-registration
+/* http://www.evanmiller.org/nginx-modules-guide.html#lb-registration
+
+It registers an upstream initialization function with the surrounding upstream configuration. In addition, the registration function defines which options to the server directive are legal inside this particular upstream block (e.g., weight=, fail_timeout=).
+*/
 static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     // directive arguments
     ngx_str_t *value = cf->args->elts;
     // upstream servers config (that variable usually called uscf in another modules)
     ngx_http_upstream_srv_conf_t *ussv;
-    // upstream parameters config
-    struct upstream_consistent_replicated_config *uscf;
+    // upstream parameters config (this is NOT what is called uscf in some other upstream modules)
+    upstream_consistent_replicated_config_t *uscf;
 
     ussv = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
 
@@ -155,9 +163,12 @@ invalid:
 }
 
 
-// http://www.evanmiller.org/nginx-modules-guide.html#lb-upstream
+/* http://www.evanmiller.org/nginx-modules-guide.html#lb-upstream
+
+The purpose of the upstream initialization function is to resolve the host names, allocate space for sockets, and assign (yet another) callback.
+*/
 static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *ussv) {
-    struct upstream_consistent_replicated_config *uscf = ussv->peer.data;
+    upstream_consistent_replicated_config_t *uscf = ussv->peer.data;
     ngx_http_upstream_server_t *server;
     unsigned int buckets_count, i, j, n;
     ngx_http_upstream_hash_peers_t  *peers;
@@ -184,8 +195,8 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
     for (n = 0, i = 0; i < ussv->servers->nelts; i++) {
         for (j = 0; j < servers[i].naddrs; j++, n++) {
             peers[n].sockaddr = servers[i].addrs[j].sockaddr;
-            peers[n].socklen = servers[i].addrs[j].socklen;
-            peers[n].name = servers[i].addrs[j].name;
+            peers[n].socklen  = servers[i].addrs[j].socklen;
+            peers[n].name     = servers[i].addrs[j].name;
         }
     }
 
@@ -196,14 +207,23 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
 }
 
 
-// http://www.evanmiller.org/nginx-modules-guide.html#lb-peer
+/* http://www.evanmiller.org/nginx-modules-guide.html#lb-peer
+
+The peer initialization function is called once per request. It sets up a data structure that the module will use as it tries to find an appropriate backend server to service that request; this structure is persistent across backend re-tries, so it's a convenient place to keep track of the number of connection failures, or a computed hash value.
+
+In addition, the peer initalization function sets up two callbacks:
+  get: the load-balancing function
+  free: the peer release function (usually just updates some statistics when a connection finishes)
+
+As if that weren't enough, it also initalizes a variable called tries. As long as tries is positive, nginx will keep retrying this load-balancer.
+*/
 static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *ussv) {
-    // I would rather call it request data, but `peer` seems a convention
+    // I would rather call that struct request data, but `peer` seems a convention
     ngx_http_upstream_consistent_replicated_peer_data_t     *ucpd;
     ngx_buf_t *b;
-    
+
     ngx_http_upstream_consistent_replicated_data_t *ucd = ussv->peer.data;
-    
+
     ucpd = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_consistent_replicated_peer_data_t));
     if (ucpd == NULL) {
         return NGX_ERROR;
@@ -217,7 +237,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
     r->upstream->peer.tries = ucd->peer.data->replication_level;
 
     // TODO get key and length from variable
-    ucpd->key.len = b->end-b->start-sizeof("get ")-sizeof(CRLF)+3;
+    ucpd->key.len = b->end - b->start - sizeof("get ") - sizeof(CRLF) + 3;
 
     ucpd->key.data = ngx_pcalloc(r->pool, ucpd->key.len);
 
@@ -226,7 +246,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
     }
 
     ngx_cpystrn(ucpd->key.data, b->start+4, ucpd->key.len);
-    
+
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "upstream_consistent: key \"%V\"", &ucpd->key);
 
     ucpd->hash = ngx_http_upstream_consistent_ketama_hash(ucpd->key.data, ucpd->key.len-1, 0);
@@ -242,7 +262,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
 
 
 // http://www.evanmiller.org/nginx-modules-guide.html#lb-function
-static ngx_int_t ngx_http_upstream_get_consistent_peer (ngx_peer_connection_t *pc, void *data) {
+static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data) {
     ngx_http_upstream_consistent_continuum_item_t *begin, *end, *left, *right, *middle;
     ngx_http_upstream_consistent_peer_data_t  *ucpd = data;
     ngx_http_upstream_consistent_peer_t       *peer;
