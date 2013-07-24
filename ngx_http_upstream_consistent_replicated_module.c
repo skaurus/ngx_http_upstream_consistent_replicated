@@ -169,9 +169,9 @@ The purpose of the upstream initialization function is to resolve the host names
 */
 static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *ussv) {
     upstream_consistent_replicated_config_t *uscf = ussv->peer.data;
-    ngx_http_upstream_server_t *server;
-    unsigned int buckets_count, i, j, n;
-    ngx_http_upstream_hash_peers_t  *peers;
+    ngx_http_upstream_server_t              *server;
+    ngx_uint_t                              buckets_count, i, j, n, total_weight, points_per_server;
+    ngx_http_upstream_hash_peers_t          *peers;
 
     /* set the callback */
     ussv->peer.init = ngx_http_upstream_init_consistent_replicated_peer;
@@ -191,12 +191,45 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
     /* allocate space for sockets, etc */
     peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_consistent_replicated_peer_addr_t) * n);
 
-    /* one hostname can have multiple IP addresses in DNS */
+    // fill peers, prepare to create ketama continuum
+    total_weight = 0;
     for (n = 0, i = 0; i < ussv->servers->nelts; i++) {
+        /* one hostname can have multiple IP addresses in DNS */
         for (j = 0; j < servers[i].naddrs; j++, n++) {
             peers[n].sockaddr = servers[i].addrs[j].sockaddr;
             peers[n].socklen  = servers[i].addrs[j].socklen;
             peers[n].name     = servers[i].addrs[j].name;
+        }
+        total_weight += servers[i].weight;
+    }
+
+    // create continuum
+    // TODO support for ketama_points == 0 (no ketama)
+    for (i = 0; i < ussv->servers->nelts; i++) {
+        float pct = (float) servers[i].weight / (float) total_weight;
+        points_per_server = floorf( pct * (float) uscf->ketama_points / 4 * (float) ussv->servers->nelts );
+
+        for (j = 0; j < points_per_server; j++) {
+            /* 40 hashes, 4 numbers per hash = 160 points per server */
+            char ss[30];
+            unsigned char digest[16];
+
+            sprintf(ss, "%s-%d", slist[i].addr, j);
+            ketama_md5_digest(ss, digest);
+
+            /* Use successive 4-bytes from hash as numbers 
+             * for the points on the circle: */
+            int h;
+            for( h = 0; h < 4; h++ )
+            {
+                continuum[cont].point = ( digest[3+h*4] << 24 )
+                                      | ( digest[2+h*4] << 16 )
+                                      | ( digest[1+h*4] <<  8 )
+                                      |   digest[h*4];
+
+                memcpy( continuum[cont].ip, slist[i].addr, 22 );
+                cont++;
+            }
         }
     }
 
