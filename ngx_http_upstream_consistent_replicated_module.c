@@ -71,6 +71,11 @@ ngx_module_t ngx_http_upstream_consistent_replicated_module = {
 // U is not valid in hex numbers and means that number is unsigned
 #define CONTINUUM_MAX_POINT  0xffffffffU
 
+// allowed ketama alg types (perl one uses crc32, libketama - md5)
+// perl_cmf stands for "Perl Cache::Memcached::Fast module"
+static const char *KETAMA_ALG_PERL_CMF = "perl_cmf";
+static const char *KETAMA_ALG_LIBKETAMA = "libketama";
+
 
 typedef struct {
     struct sockaddr                *sockaddr;
@@ -81,6 +86,7 @@ typedef struct {
 typedef struct {
     ngx_uint_t                                              ketama_points;
     ngx_uint_t                                              replication_level;
+    ngx_str_t                                               ketama_alg;
     ngx_uint_t                                              peers_count;
     ngx_http_upstream_consistent_replicated_peer_addr_t     *peers;
 } upstream_consistent_replicated_config_t;
@@ -105,7 +111,8 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
 
     ussv = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
 
-    int ketama_points = 150, replication_level = 1;
+    int ketama_points = 0, replication_level = 1;
+    ngx_str_t ketama_alg = ngx_string(KETAMA_ALG_PERL_CMF);
     unsigned int i;
 
     // let's parse arguments
@@ -121,9 +128,26 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
         }
 
         if (ngx_strncmp(value[i].data, "replication_level=", 18) == 0) {
-            replication_level = ngx_atoi(&value[i].data[14], value[i].len - 18);
+            replication_level = ngx_atoi(&value[i].data[18], value[i].len - 18);
 
             if (replication_level == NGX_ERROR || replication_level < 0) {
+                goto invalid;
+            }
+
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "ketama_alg=", 11) == 0) {
+            // value[i].len holds string length without the terminator
+            char alg[value[i].len - 11 + 1];
+            strncpy(alg, &value[i].data[11], sizeof(alg));
+            ketama_alg = ngx_string(alg);
+
+            if ( ngx_strncmp(alg, KETAMA_ALG_PERL_CMF, sizeof(alg)) == 0 ) {
+                ketama_alg = ngx_string(alg);
+            } else if ( ngx_strncmp(alg, KETAMA_ALG_LIBKETAMA, sizeof(alg)) == 0 ) {
+                ketama_alg = ngx_string(alg);
+            } else {
                 goto invalid;
             }
 
@@ -142,6 +166,7 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
     // fill our config structure with parameters
     uscf->ketama_points     = ketama_points;
     uscf->replication_level = replication_level;
+    uscf->ketama_alg        = ketama_alg;
 
     // fill upstream servers config
     ussv->peer.data = uscf;
@@ -203,38 +228,94 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
         total_weight += servers[i].weight;
     }
 
-    // create continuum
-    // TODO support for ketama_points == 0 (no ketama)
-    for (i = 0; i < ussv->servers->nelts; i++) {
-        float pct = (float) servers[i].weight / (float) total_weight;
-        points_per_server = floorf( pct * (float) uscf->ketama_points / 4 * (float) ussv->servers->nelts );
-
-        for (j = 0; j < points_per_server; j++) {
-            /* 40 hashes, 4 numbers per hash = 160 points per server */
-            char ss[30];
-            unsigned char digest[16];
-
-            sprintf(ss, "%s-%d", slist[i].addr, j);
-            ketama_md5_digest(ss, digest);
-
-            /* Use successive 4-bytes from hash as numbers 
-             * for the points on the circle: */
-            int h;
-            for( h = 0; h < 4; h++ )
-            {
-                continuum[cont].point = ( digest[3+h*4] << 24 )
-                                      | ( digest[2+h*4] << 16 )
-                                      | ( digest[1+h*4] <<  8 )
-                                      |   digest[h*4];
-
-                memcpy( continuum[cont].ip, slist[i].addr, 22 );
-                cont++;
-            }
-        }
-    }
-
     ussv->peer.data->peers_count = n;
     ussv->peer.data->peers       = peers;
+
+    if (uscf->ketama_points > 0) {
+        // create continuum
+
+        if ( gx_strncmp(uscf->ketama_alg, KETAMA_ALG_PERL_CMF, sizeof(uscf->ketama_alg)) == 0 ) {
+            // if using Cache::Memcached::Fast logic (based on crc32 hashing)
+
+            for (i = 0; i < us->servers->nelts; ++i) {
+                static const char delim = '\0';
+                u_char *host, *port;
+                ngx_uint_t len = 0, port_len = 0, crc32, point, count;
+
+                host = server[i].name.data;
+                len = server[i].name.len;
+
+#if NGX_HAVE_UNIX_DOMAIN
+                if (ngx_strncasecmp(host, (u_char *) "unix:", 5) == 0) {
+                    host += 5;
+                    len -= 5;
+                }
+#endif /* NGX_HAVE_UNIX_DOMAIN */
+
+                port = host;
+                while (*port) {
+                    if (*port++ == ':') {
+                        port_len = len - (port - host);
+                        len = (port - host) - 1;
+                        break;
+                    }
+                }
+
+                ngx_crc32_init(crc32);
+                ngx_crc32_update(&crc32, host, len);
+                ngx_crc32_update(&crc32, (u_char *) &delim, 1);
+                ngx_crc32_update(&crc32, port, port_len); 
+
+                point = 0;
+                count = uscf->ketama_points * server[i].weight;
+
+                for (j = 0; j < count; ++j) {
+                    u_char buf[4];
+                    ngx_uint_t new_point = crc32, bucket;
+
+                    
+                }
+
+            }
+
+        } else {
+            // if using libketama algorithm (based on md5 hashing)
+
+            // TODO
+            for (i = 0; i < ussv->servers->nelts; i++) {
+                float pct = (float) servers[i].weight / (float) total_weight;
+                points_per_server = floorf( pct * (float) uscf->ketama_points / 4 * (float) ussv->servers->nelts );
+
+                for (j = 0; j < points_per_server; j++) {
+                    /* 40 hashes, 4 numbers per hash = 160 points per server */
+                    char ss[30];
+                    unsigned char digest[16];
+
+                    sprintf(ss, "%s-%d", slist[i].addr, j);
+                    ketama_md5_digest(ss, digest);
+
+                    /* Use successive 4-bytes from hash as numbers 
+                     * for the points on the circle: */
+                    int h;
+                    for (h = 0; h < 4; h++) {
+                        continuum[cont].point = ( digest[3+h*4] << 24 )
+                                              | ( digest[2+h*4] << 16 )
+                                              | ( digest[1+h*4] <<  8 )
+                                              |   digest[h*4];
+
+                        memcpy( continuum[cont].ip, slist[i].addr, 22 );
+                        cont++;
+                    }
+                }
+            }
+
+        }
+
+    } else {
+        // if ketama_points == 0
+
+        // TODO
+    }
 
     return NGX_OK;
 }
