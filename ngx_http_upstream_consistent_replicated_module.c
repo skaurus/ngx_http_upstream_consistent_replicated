@@ -19,6 +19,14 @@
 #include <math.h>
 
 
+// some prototypes so I can later use these names before I actually declare them
+static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *uscf);
+static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *uscf);
+static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data);
+static void ngx_http_upstream_free_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data, ngx_uint_t state);
+
+
 // http://www.evanmiller.org/nginx-modules-guide.html#directives
 static ngx_command_t ngx_http_upstream_consistent_replicated_commands[] = {
     {
@@ -73,14 +81,15 @@ ngx_module_t ngx_http_upstream_consistent_replicated_module = {
 
 // allowed ketama alg types (perl one uses crc32, libketama - md5)
 // perl_cmf stands for "Perl Cache::Memcached::Fast module"
-static const char *HASHING_ALG_PERL_CMF = "perl_cmf";
+static const char *HASHING_ALG_PERL_CMF  = "perl_cmf";
 static const char *HASHING_ALG_LIBKETAMA = "libketama";
 
 
 typedef struct {
-    struct sockaddr                                *sockaddr;
-    socklen_t                                       socklen;
-    ngx_str_t                                       name;
+    ngx_http_upstream_server_t                     *server;
+    ngx_uint_t                                      addr_index;
+    time_t                                          accessed;
+    ngx_uint_t                                      fails;
 } upstream_consistent_replicated_peer_addr_t;
 
 typedef struct {
@@ -105,21 +114,17 @@ typedef struct {
     ngx_int_t                                       req_key_var_index;
     upstream_consistent_replicated_peer_addr_t     *peers;
     upstream_consistent_replicated_continuum_t     *continuum;
-} upstream_consistent_replicated_config_t;
+} upstream_consistent_replicated_data_t;
 
 // this structure fills up one time per request and reused while searching for backend
 typedef struct {
     ngx_uint_t                                      hash;
     ngx_str_t                                       key;
-    upstream_consistent_replicated_config_t        *upstream_config;
+    ngx_uint_t                                      peer_tries;
+    upstream_consistent_replicated_peer_addr_t     *peer;
+    upstream_consistent_replicated_data_t          *usd;
 } ngx_http_upstream_consistent_peer_data_t;
 
-
-
-// some prototypes to I can define functions in logical order
-static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *ussv);
-static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *ussv);
-static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data);
 
 
 // variables names
@@ -127,8 +132,8 @@ static ngx_str_t replication_level_var  = ngx_string("consistent_replicated_repl
 static ngx_str_t requested_key_var      = ngx_string("consistent_replicated_key");
 
 
-
-static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replicated_continuum_t *continuum, ngx_uint_t point) {
+// some service function
+static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replicated_continuum_t *continuum, unsigned int point) {
     upstream_consistent_replicated_continuum_point_t *left, *right;
 
     left  = continuum->buckets;
@@ -159,6 +164,37 @@ static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replica
 }
 
 
+// some service function
+static ngx_uint_t ngx_http_upstream_consistent_replicated_hash(ngx_str_t key, upstream_consistent_replicated_data_t *usd) {
+    ngx_uint_t hash;
+
+    if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, sizeof(usd->hashing_alg)) == 0 ) {
+        hash = ngx_crc32_long(key.data, key.len);
+
+        // don't know what happening here; taken from memcached_hash module.
+        if (usd->ketama_points == 0) {
+            hash = ((hash >> 16) & 0x00007fffU);
+            hash = hash % usd->total_weight;
+            hash = (uint64_t) hash * CONTINUUM_MAX_POINT;
+            /*
+              Shift point one step forward to possibly get from the
+              border point which belongs to the previous bucket.
+            */
+            hash += 1;
+        }
+
+    } else {
+        // TODO
+        hash = 0;
+
+    }
+
+    return hash;
+}
+
+
+// And there goes module functions that Nginx will actually use
+
 /* http://www.evanmiller.org/nginx-modules-guide.html#lb-registration
 
 It registers an upstream initialization function with the surrounding upstream configuration. In addition, the registration function defines which options to the server directive are legal inside this particular upstream block (e.g., weight=, fail_timeout=).
@@ -166,12 +202,12 @@ It registers an upstream initialization function with the surrounding upstream c
 static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     // directive arguments
     ngx_str_t *value = cf->args->elts;
-    // upstream servers config (that variable usually called uscf in another modules)
-    ngx_http_upstream_srv_conf_t *ussv;
-    // upstream parameters config (this is NOT what is called uscf in some other upstream modules)
-    upstream_consistent_replicated_config_t *uscf;
+    // upstream config
+    ngx_http_upstream_srv_conf_t *uscf;
+    // variable where most of the data stored
+    upstream_consistent_replicated_data_t *usd;
 
-    ussv = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
+    uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
 
     int ketama_points = 0, replication_level = 1;
     ngx_str_t hashing_alg = ngx_string(HASHING_ALG_PERL_CMF);
@@ -200,14 +236,12 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
         }
 
         if (ngx_strncmp(value[i].data, "hashing_alg=", 12) == 0) {
-            // value[i].len holds string length without the terminator
-            char alg[value[i].len - 12 + 1];
-            strncpy(alg, &value[i].data[12], sizeof(alg));
+            ngx_str_t alg = ngx_string(&value[i].data[12]);
 
-            if ( ngx_strncmp(alg, HASHING_ALG_PERL_CMF, sizeof(alg)) == 0 ) {
-                hashing_alg = ngx_string(alg);
-            } else if ( ngx_strncmp(alg, HASHING_ALG_LIBKETAMA, sizeof(alg)) == 0 ) {
-                hashing_alg = ngx_string(alg);
+            if ( ngx_strncmp(alg.data, HASHING_ALG_PERL_CMF, alg.len + 1) == 0 ) {
+                hashing_alg = alg;
+            } else if ( ngx_strncmp(alg.data, HASHING_ALG_LIBKETAMA, alg.len + 1) == 0 ) {
+                hashing_alg = alg;
             } else {
                 goto invalid;
             }
@@ -219,22 +253,25 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
     }
 
     // in that structure we will store both directive parameters and peers
-    uscf = ngx_palloc(cf->pool, sizeof(upstream_consistent_replicated_config));
-    if (!uscf) {
-        return NGX_ERROR;
+    usd = ngx_palloc(cf->pool, sizeof(upstream_consistent_replicated_data_t));
+    if (!usd) {
+        return "not enough memory";
     }
 
     // fill our config structure with parameters
-    uscf->ketama_points     = ketama_points;
-    uscf->replication_level = replication_level;
-    uscf->hashing_alg       = hashing_alg;
+    usd->ketama_points     = ketama_points;
+ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "ketama %d", ketama_points);
+    usd->replication_level = replication_level;
+ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "level %d", replication_level);
+    usd->hashing_alg       = hashing_alg;
+ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "alg %s", hashing_alg.data);
 
     // fill upstream servers config
-    ussv->peer.data = uscf;
+    uscf->peer.data = usd;
 
-    ussv->peer.init_upstream = ngx_http_upstream_init_consistent_replicated;
+    uscf->peer.init_upstream = ngx_http_upstream_init_consistent_replicated;
 
-    ussv->flags = (NGX_HTTP_UPSTREAM_CREATE
+    uscf->flags = (NGX_HTTP_UPSTREAM_CREATE
                  | NGX_HTTP_UPSTREAM_WEIGHT
                  | NGX_HTTP_UPSTREAM_MAX_FAILS
                  | NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
@@ -254,82 +291,77 @@ invalid:
 
 The purpose of the upstream initialization function is to resolve the host names, allocate space for sockets, and assign (yet another) callback.
 */
-static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *ussv) {
-    upstream_consistent_replicated_config_t *uscf = ussv->peer.data;
-    ngx_http_upstream_server_t              *server;
-    ngx_uint_t                               i, j, n;
-    ngx_http_upstream_hash_peers_t          *peers;
+static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *uscf) {
+    upstream_consistent_replicated_data_t      *usd = uscf->peer.data;
+    ngx_http_upstream_server_t                 *servers;
+    ngx_uint_t                                  i, j;
+    upstream_consistent_replicated_peer_addr_t *peers;
 
     /* set the callback */
-    ussv->peer.init = ngx_http_upstream_init_consistent_replicated_peer;
+    uscf->peer.init = ngx_http_upstream_init_consistent_replicated_peer;
 
-    if (!ussv->servers) {
+    if (!uscf->servers) {
         return NGX_ERROR;
     }
 
-    servers = ussv->servers->elts;
-
-    /* figure out how many IP addresses are in this upstream block. */
-    /* remember a domain name can resolve to multiple IP addresses. */
-    for (n = 0, i = 0; i < ussv->servers->nelts; i++) {
-        n += servers[i].naddrs;
-    }
+    servers = uscf->servers->elts;
 
     /* allocate space for sockets, etc */
-    peers = ngx_pcalloc(cf->pool, sizeof(upstream_consistent_replicated_peer_addr_t) * n);
+    peers = ngx_pcalloc(cf->pool, sizeof(upstream_consistent_replicated_peer_addr_t) * uscf->servers->nelts);
     if (!peers) {
         return NGX_ERROR;
     }
 
     // fill peers, prepare to create ketama continuum
-    uscf->total_weight = 0;
-    for (n = 0, i = 0; i < ussv->servers->nelts; i++) {
-        /* one hostname can have multiple IP addresses in DNS */
-        for (j = 0; j < servers[i].naddrs; j++, n++) {
-            peers[n].sockaddr = servers[i].addrs[j].sockaddr;
-            peers[n].socklen  = servers[i].addrs[j].socklen;
-            peers[n].name     = servers[i].addrs[j].name;
-        }
-        uscf->total_weight += servers[i].weight;
+    usd->total_weight = 0;
+    for (i = 0; i < uscf->servers->nelts; i++) {
+        ngx_memzero(&peers[i], sizeof(peers[i]));
+        peers[i].server = &servers[i];
+        usd->total_weight += servers[i].weight;
     }
+ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
 
-    uscf->peers_count = n;
-    uscf->peers       = peers;
+    usd->peers_count = uscf->servers->nelts;
+    usd->peers       = peers;
 
-    uscf->repl_var_index    = ngx_http_get_variable_index(cf, &replication_level_var);
-    uscf->req_key_var_index = ngx_http_get_variable_index(cf, &requested_key_var);
+ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "1");
+    usd->repl_var_index    = ngx_http_get_variable_index(cf, &replication_level_var);
+ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "2");
+    usd->req_key_var_index = ngx_http_get_variable_index(cf, &requested_key_var);
+ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "3");
 
 
-    if (uscf->ketama_points > 0) {
+    if (usd->ketama_points > 0) {
         // create continuum
 
-        uscf->continuum = ngx_pcalloc(cf->pool, sizeof(upstream_consistent_replicated_continuum_t));
-        if (!uscf->continuum) {
+        usd->continuum = ngx_pcalloc(cf->pool, sizeof(upstream_consistent_replicated_continuum_t));
+        if (!usd->continuum) {
             return NGX_ERROR;
         }
 
         ngx_uint_t buckets_count = 0;
-        for (i = 0; i < ussv->servers->nelts; ++i) {
-            buckets_count += uscf->ketama_points * servers[i].weight;
+        for (i = 0; i < uscf->servers->nelts; ++i) {
+            buckets_count += usd->ketama_points * servers[i].weight;
         }
 
-        uscf->continuum->buckets = ngx_pcalloc(cf->pool, sizeof(upstream_consistent_replicated_continuum_point_t) * buckets_count);
-        if (!uscf->continuum->buckets) {
+        usd->continuum->buckets = ngx_pcalloc(cf->pool, sizeof(upstream_consistent_replicated_continuum_point_t) * buckets_count);
+        if (!usd->continuum->buckets) {
             return NGX_ERROR;
         }
 
-        if ( ngx_strncmp(uscf->hashing_alg, HASHING_ALG_PERL_CMF, sizeof(uscf->hashing_alg)) == 0 ) {
+        if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, sizeof(usd->hashing_alg)) == 0 ) {
             // if using Cache::Memcached::Fast logic (based on crc32 hashing)
 
-            uscf->continuum->buckets_count = 0;
+            usd->continuum->buckets_count = 0;
 
-            for (i = 0; i < ussv->servers->nelts; ++i) {
+            for (i = 0; i < uscf->servers->nelts; ++i) {
                 static const char delim = '\0';
                 u_char *host, *port;
-                ngx_uint_t len = 0, port_len = 0, crc32, point, count;
+                size_t len, port_len = 0;
+                unsigned int crc32, point, count;
 
-                host = server[i].name.data;
-                len = server[i].name.len;
+                host = servers[i].addrs[0].name.data;
+                len = servers[i].addrs[0].name.len;
 
 #if NGX_HAVE_UNIX_DOMAIN
                 if (ngx_strncasecmp(host, (u_char *) "unix:", 5) == 0) {
@@ -353,11 +385,12 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
                 ngx_crc32_update(&crc32, port, port_len); 
 
                 point = 0;
-                count = uscf->ketama_points * server[i].weight;
+                count = usd->ketama_points * servers[i].weight;
 
                 for (j = 0; j < count; ++j) {
                     u_char buf[4];
-                    ngx_uint_t new_point = crc32, bucket;
+                    unsigned int new_point = crc32;
+                    ngx_uint_t bucket;
 
                     /*
                       We want the same result on all platforms, so we
@@ -372,15 +405,15 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
                     ngx_crc32_final(new_point);
                     point = new_point;
 
-                    if (uscf->continuum->buckets_count > 0) {
-                        bucket = consistent_replicated_find_bucket(uscf->continuum, point);
+                    if (usd->continuum->buckets_count > 0) {
+                        bucket = consistent_replicated_find_bucket(usd->continuum, point);
 
                         /*
                           Check if we wrapped around but actually have new
                           max point.
                         */
-                        if (bucket == 0 && point > uscf->continuum->buckets[0].point) {
-                            bucket = uscf->continuum->buckets_count;
+                        if (bucket == 0 && point > usd->continuum->buckets[0].point) {
+                            bucket = usd->continuum->buckets_count;
 
                         } else {
                             /*
@@ -390,16 +423,16 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
                               ours after the first server for not to change
                               key distribution.
                             */
-                            while (bucket != uscf->continuum->buckets_count && uscf->continuum->buckets[bucket].point == point) {
+                            while (bucket != usd->continuum->buckets_count && usd->continuum->buckets[bucket].point == point) {
                                 ++bucket;
                             }
 
                             /* Move the tail one position forward.  */
-                            if (bucket != uscf->continuum->buckets_count) {
+                            if (bucket != usd->continuum->buckets_count) {
                                 ngx_memmove(
-                                    uscf->continuum->buckets + bucket + 1,
-                                    uscf->continuum->buckets + bucket,
-                                    (uscf->continuum->buckets_count - bucket) * sizeof(*uscf->continuum->buckets)
+                                    usd->continuum->buckets + bucket + 1,
+                                    usd->continuum->buckets + bucket,
+                                    (usd->continuum->buckets_count - bucket) * sizeof(*usd->continuum->buckets)
                                 );
                             }
                         }
@@ -408,10 +441,10 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
                         bucket = 0;
                     }
 
-                    uscf->continuum->buckets[bucket].point = point;
-                    uscf->continuum->buckets[bucket].index = i;
+                    usd->continuum->buckets[bucket].point = point;
+                    usd->continuum->buckets[bucket].index = i;
 
-                    ++uscf->continuum->buckets_count;
+                    ++usd->continuum->buckets_count;
 
                 } // for loop over points per server END
 
@@ -421,30 +454,34 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
             // if using libketama algorithm (based on md5 hashing)
 
             // TODO
-            for (i = 0; i < ussv->servers->nelts; i++) {
-                float pct = (float) servers[i].weight / (float) uscf->total_weight;
-                ngx_uint_t points_per_server = floorf( pct * (float) uscf->ketama_points / 4 * (float) ussv->servers->nelts );
+            for (i = 0; i < uscf->servers->nelts; i++) {
+                float pct = (float) servers[i].weight / (float) usd->total_weight;
+                ngx_uint_t points_per_server = floorf( pct * (float) usd->ketama_points / 4 * (float) uscf->servers->nelts );
 
                 for (j = 0; j < points_per_server; j++) {
                     /* 40 hashes, 4 numbers per hash = 160 points per server */
                     char ss[30];
                     unsigned char digest[16];
 
-                    sprintf(ss, "%s-%d", slist[i].addr, j);
-                    ketama_md5_digest(ss, digest);
+                    sprintf(ss, "%s-%d", servers[i].addrs[0].name.data, (int) j);
+
+                    ngx_md5_t md5;
+                    ngx_md5_init(&md5);
+                    ngx_md5_update(&md5, ss, strlen(ss));
+                    ngx_md5_final(digest, &md5);
 
                     /* Use successive 4-bytes from hash as numbers 
                      * for the points on the circle: */
-                    int h;
+/*                    int h;
                     for (h = 0; h < 4; h++) {
-                        continuum[cont].point = ( digest[3+h*4] << 24 )
-                                              | ( digest[2+h*4] << 16 )
-                                              | ( digest[1+h*4] <<  8 )
-                                              |   digest[h*4];
+                        usd->continuum[cont].point = ( digest[3+h*4] << 24 )
+                                                   | ( digest[2+h*4] << 16 )
+                                                   | ( digest[1+h*4] <<  8 )
+                                                   |   digest[h*4];
 
-                        memcpy( continuum[cont].ip, slist[i].addr, 22 );
+                        memcpy( usd->continuum[cont].ip, slist[i].addr, 22 );
                         cont++;
-                    }
+                    }*/
                 }
             }
 
@@ -453,23 +490,23 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
     } else {
         // if ketama_points == 0
 
-        if ( ngx_strncmp(uscf->hashing_alg, HASHING_ALG_PERL_CMF, sizeof(uscf->hashing_alg)) == 0 ) {
+        if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, sizeof(usd->hashing_alg)) == 0 ) {
             ngx_uint_t total_weight = 0;
 
-            for (i = 0; i < ussv->servers->nelts; ++i) {
-                total_weight += server[i].weight;
+            for (i = 0; i < uscf->servers->nelts; ++i) {
+                total_weight += servers[i].weight;
 
                 for (j = 0; j < i; ++j) {
-                    uscf->continuum->buckets[j].point =
-                        (uint64_t) uscf->continuum->buckets[j].point
-                        * (total_weight - server[i].weight) / total_weight;
+                    usd->continuum->buckets[j].point =
+                        (uint64_t) usd->continuum->buckets[j].point
+                        * (total_weight - servers[i].weight) / total_weight;
                 }
 
-                uscf->continuum->buckets[i].point = CONTINUUM_MAX_POINT;
-                uscf->continuum->buckets[i].index = i;
+                usd->continuum->buckets[i].point = CONTINUUM_MAX_POINT;
+                usd->continuum->buckets[i].index = i;
             }
 
-            uscf->continuum->buckets_count = ussv->servers->nelts;
+            usd->continuum->buckets_count = uscf->servers->nelts;
 
         } else {
             // TODO
@@ -492,19 +529,23 @@ In addition, the peer initalization function sets up two callbacks:
 
 As if that weren't enough, it also initalizes a variable called tries. As long as tries is positive, nginx will keep retrying this load-balancer.
 */
-static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *ussv) {
+static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *uscf) {
     // I would rather call that struct request data, but `peer` seems a convention
-    ngx_http_upstream_consistent_peer_data_t    *ucpd;
-    ngx_buf_t *b;
+    ngx_http_upstream_consistent_peer_data_t   *ucpd;
+    ngx_http_variable_value_t                  *vv;
+    ngx_int_t                                   replication_level;
+    ngx_str_t                                   requested_key;
 
-    upstream_consistent_replicated_config_t *uscf = ussv->peer.data;
+    upstream_consistent_replicated_data_t *usd = uscf->peer.data;
 
     ucpd = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_consistent_peer_data_t));
     if (ucpd == NULL) {
         return NGX_ERROR;
     }
 
-    ucpd->upstream_config = uscf;
+    ucpd->usd        = usd;
+    ucpd->peer       = NULL;
+    ucpd->peer_tries = 0;
 
     r->upstream->peer.data = ucpd;
 
@@ -515,27 +556,35 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
     /*  get replication level value of request; by default it equals to
         upstream setting which in turn by default equals to one.
     */
-    ngx_uint_t replication_level = ngx_http_get_indexed_variable(r, uscf->repl_var_index);
+    vv = ngx_http_get_indexed_variable(r, usd->repl_var_index);
     if (vv == NULL || vv->not_found || vv->len == 0) {
-        replication_level = uscf->peer.data->replication_level;
+        replication_level = usd->replication_level;
+    } else {
+        replication_level = ngx_atoi(vv->data, vv->len);
+        if (replication_level == NGX_ERROR || replication_level <= 0) {
+            return NGX_ERROR;
+        }
     }
 
     // get requested key
-    ngx_str_t requested_key = ngx_http_get_indexed_variable(r, uscf->req_key_var_index);
-    if (requested_key == NULL || requested_key->not_found || requested_key->len == 0) {
+    vv = ngx_http_get_indexed_variable(r, usd->req_key_var_index);
+    if (vv == NULL || vv->not_found || vv->len == 0) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "the \"$consistent_replicated_key\" variable is not set");
         return NGX_ERROR;
+    } else {
+        requested_key.data = vv->data;
+        requested_key.len  = vv->len;
     }
 
 
-    r->upstream->peer.tries = replication_level;
+    r->upstream->peer.tries = (ngx_uint_t) replication_level;
 
     ucpd->key = requested_key;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "upstream_consistent: key \"%V\"", &ucpd->key);
 
-    ucpd->hash = ngx_http_upstream_consistent_ketama_hash(ucpd->key.data, ucpd->key.len-1, 0);
+    ucpd->hash = ngx_http_upstream_consistent_replicated_hash(ucpd->key, usd);
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "upstream_consistent: hash %ui", ucpd->hash);
 
@@ -544,39 +593,98 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
 }
 
 
-// http://www.evanmiller.org/nginx-modules-guide.html#lb-function
-static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data) {
-    ngx_http_upstream_consistent_continuum_item_t *begin, *end, *left, *right, *middle;
-    ngx_http_upstream_consistent_peer_data_t  *ucpd = data;
-    ngx_http_upstream_consistent_peer_t       *peer;
+/* http://www.evanmiller.org/nginx-modules-guide.html#lb-function
 
+It's time for the main course. The real meat and potatoes. This is where the module picks an upstream.
+*/ 
+static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data) {
+    ngx_http_upstream_consistent_peer_data_t   *ucpd = data;
+    upstream_consistent_replicated_data_t      *usd  = ucpd->usd;
+    upstream_consistent_replicated_peer_addr_t *peer = ucpd->peer;
+    ngx_addr_t                                 *addr;
+
+    /*
+      I don't really understand why we do this, but maybe the reason is that connection caching is now
+      done via upstream_keepalive module.
+    */
     pc->cached = 0;
     pc->connection = NULL;
 
-    begin = left = ucpd->continuum;
-    end = right = ucpd->continuum + ucpd->continuum_points_counter;
+    if (!peer) {
+        ngx_uint_t bucket = consistent_replicated_find_bucket(usd->continuum, ucpd->hash);
+        peer = &usd->peers[ usd->continuum->buckets[bucket].index ];
+        peer->addr_index = 0;
 
-    while (left < right) {
-        middle = left + (right - left) / 2;
-        if (middle->value < ucpd->hash) {
-            left = middle + 1;
+        ucpd->peer_tries = peer->server->naddrs;
+    }
+
+    if (peer->server->down) {
+        goto fail;
+    }
+
+    if (peer->server->max_fails > 0 && peer->fails >= peer->server->max_fails) {
+        time_t now = ngx_time();
+        if (now - peer->accessed <= peer->server->fail_timeout) {
+            goto fail;
         } else {
-            right = middle;
+            peer->fails = 0;
         }
     }
 
-    if (right == end) {
-        right = begin;
-    }
-    
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "upstream_consistent: continuum pointer %ui", right->value);
+    addr = &peer->server->addrs[peer->addr_index];
 
-    peer = &ucpd->peers[right->index];
-
-    pc->sockaddr = peer->server->addrs->sockaddr;
-    pc->socklen = peer->server->addrs->socklen;
-    pc->name = &peer->server->addrs->name;
+    pc->sockaddr =  addr->sockaddr;
+    pc->socklen  =  addr->socklen;
+    pc->name     = &addr->name;
 
     return NGX_OK;
+
+fail:
+    return NGX_BUSY;
+}
+
+
+/* http://www.evanmiller.org/nginx-modules-guide.html#lb-release
+
+The peer release function operates after an upstream connection takes place; its purpose is to track failures.
+*/
+static void ngx_http_upstream_free_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data, ngx_uint_t state) {
+    ngx_http_upstream_consistent_peer_data_t   *ucpd = data;
+    upstream_consistent_replicated_peer_addr_t *peer = ucpd->peer;
+
+    if (state & NGX_PEER_FAILED) {
+        if (peer->server->max_fails > 0) {
+            time_t now = ngx_time();
+            if (now - peer->accessed > peer->server->fail_timeout) {
+                peer->fails = 0;
+            }
+
+            ++peer->fails;
+
+            if (peer->fails == 1 || peer->fails == peer->server->max_fails) {
+                peer->accessed = ngx_time();
+            }
+        }
+
+        if (--ucpd->peer_tries > 0) {
+            // first we should try all addresses of this peer...
+            if (++peer->addr_index == peer->server->naddrs) {
+                peer->addr_index = 0;
+            }
+
+        } else {
+            // ... then move to the next peer (in case we have replication_level > 1)
+            --pc->tries;
+
+        }
+
+    } else if (state & NGX_PEER_NEXT) {
+        /*
+          If memcached gave negative (NOT_FOUND) reply, there's no need
+          to try the same cache though different address.
+        */
+        pc->tries = 0;
+
+    }
 }
 
