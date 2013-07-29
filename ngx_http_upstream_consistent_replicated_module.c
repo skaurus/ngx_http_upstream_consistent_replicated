@@ -131,6 +131,12 @@ typedef struct {
 static ngx_str_t replication_level_var  = ngx_string("consistent_replicated_repl_level");
 static ngx_str_t requested_key_var      = ngx_string("consistent_replicated_key");
 
+// Dummy subroutine to use as var->get_handler; if we don't have one nginx is
+// dying at `ngx_http_variables_init_vars` subroutine.
+static ngx_int_t dummy_variable_get_handler (ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data) {
+    return NGX_OK;
+};
+
 
 // some service function
 static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replicated_continuum_t *continuum, unsigned int point) {
@@ -296,6 +302,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
     ngx_http_upstream_server_t                 *servers;
     ngx_uint_t                                  i, j;
     upstream_consistent_replicated_peer_addr_t *peers;
+    ngx_http_variable_t                        *var;
 
     /* set the callback */
     uscf->peer.init = ngx_http_upstream_init_consistent_replicated_peer;
@@ -325,9 +332,27 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
     usd->peers       = peers;
 
 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "1");
+    /* It's possible to not set `consistent_replicated_repl_level` variable so
+       we are creating here that variable manually with default value.
+    */
+    var = ngx_http_add_variable(cf, &replication_level_var, NGX_HTTP_VAR_CHANGEABLE);
+    var->data = usd->replication_level;
+    /* Without dummy handler I got `unknown "consistent_replicated_repl_level" variable` fatal error.
+       It comes from `ngx_http_variables_init_vars` subroutine.
+    */
+    var->get_handler = dummy_variable_get_handler;
+    // get index of that variable
     usd->repl_var_index    = ngx_http_get_variable_index(cf, &replication_level_var);
+ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "repl var index %d", usd->repl_var_index);
+    if (usd->repl_var_index == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "2");
     usd->req_key_var_index = ngx_http_get_variable_index(cf, &requested_key_var);
+    if (usd->req_key_var_index == NGX_ERROR) {
+        return NGX_ERROR;
+    }
 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "3");
 
 
@@ -515,6 +540,11 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "3");
 
     }
 
+    for (i = 0; i < usd->continuum->buckets_count; i++) {
+        upstream_consistent_replicated_continuum_point_t bucket = usd->continuum->buckets[i];
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "bucket %ud [%ud]\n", bucket.index, bucket.point);
+    }
+
     return NGX_OK;
 }
 
@@ -556,15 +586,21 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
     /*  get replication level value of request; by default it equals to
         upstream setting which in turn by default equals to one.
     */
-    vv = ngx_http_get_indexed_variable(r, usd->repl_var_index);
-    if (vv == NULL || vv->not_found || vv->len == 0) {
+//    if (usd->repl_var_index < 0) {
         replication_level = usd->replication_level;
-    } else {
-        replication_level = ngx_atoi(vv->data, vv->len);
-        if (replication_level == NGX_ERROR || replication_level <= 0) {
-            return NGX_ERROR;
+/*    } else {
+        vv = ngx_http_get_indexed_variable(r, usd->repl_var_index);
+
+        if (vv == NULL || vv->not_found || vv->len == 0) {
+            replication_level = usd->replication_level;
+        } else {
+            replication_level = ngx_atoi(vv->data, vv->len);
+            if (replication_level == NGX_ERROR || replication_level <= 0) {
+                return NGX_ERROR;
+            }
         }
-    }
+
+    }*/
 
     // get requested key
     vv = ngx_http_get_indexed_variable(r, usd->req_key_var_index);
@@ -582,11 +618,11 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
 
     ucpd->key = requested_key;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "upstream_consistent: key \"%V\"", &ucpd->key);
+    ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: key \"%V\"", &ucpd->key);
 
     ucpd->hash = ngx_http_upstream_consistent_replicated_hash(ucpd->key, usd);
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "upstream_consistent: hash %ui", ucpd->hash);
+    ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: hash %ui", ucpd->hash);
 
 
     return NGX_OK;
