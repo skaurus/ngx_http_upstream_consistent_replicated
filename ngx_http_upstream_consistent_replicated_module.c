@@ -100,7 +100,6 @@ typedef struct {
 typedef struct {
     upstream_consistent_replicated_continuum_point_t *buckets;
     ngx_uint_t                                      buckets_count;
-    ngx_int_t                                       ns_index;
 } upstream_consistent_replicated_continuum_t;
 
 // this structure fills up with data during module init
@@ -121,8 +120,11 @@ typedef struct {
     ngx_uint_t                                      hash;
     ngx_str_t                                       key;
     ngx_uint_t                                      peer_tries;
+    ngx_uint_t                                      replication_level;
+    ngx_uint_t                                     *buckets;
     upstream_consistent_replicated_peer_addr_t     *peer;
     upstream_consistent_replicated_data_t          *usd;
+    ngx_log_t                                      *log;
 } ngx_http_upstream_consistent_peer_data_t;
 
 
@@ -167,6 +169,55 @@ static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replica
     }
 
     return (left - continuum->buckets);
+}
+static void consistent_replicated_fill_buckets (ngx_http_upstream_consistent_peer_data_t *ucpd) {
+    upstream_consistent_replicated_data_t      *usd       = ucpd->usd;
+    upstream_consistent_replicated_continuum_t *continuum = usd->continuum;
+    unsigned int                                point     = ucpd->hash;
+    ngx_uint_t                                 *buckets   = ucpd->buckets;
+    ngx_uint_t                                  i = 1, j, k;
+
+    // bucket that would be the the only one if replication_level were equal to 1
+    ngx_uint_t bucket = consistent_replicated_find_bucket(continuum, point);
+    buckets[0] = bucket;
+
+    // now we will move up on ketama ring to find more (uniq) peers to meet replication_level
+
+    // while we don't have enough peers selected
+    while (i < ucpd->replication_level) {
+        // Iterate over points on ketama ring (from last selected point upwards).
+        // j is the sequence number of the point.
+        for (j = bucket + 1; ; j++) {
+            /* If we reached end of continuum - return to it's beginning.
+               We could end up in forever cycle here... But I hope we would be fine if
+               we correctly checked that replication_level is <= number of peers.
+            */
+            if (j == usd->continuum->buckets_count) {
+                j = 0;
+            }
+
+            // to what peer belongs current point?
+            ngx_uint_t proposed_peer_index = usd->continuum->buckets[j].index;
+
+            // let's check if we don't selected yet that peer
+            for (k = 0; k < i; k++) {
+                ngx_uint_t selected_peer_index = usd->continuum->buckets[ buckets[k] ].index;
+                if (proposed_peer_index == selected_peer_index) {
+                    goto next;
+                }
+            }
+
+            bucket = j;
+            break;
+
+            next:
+                continue;
+        }
+
+        buckets[i++] = bucket;
+    }
+
+    return;
 }
 
 
@@ -308,6 +359,11 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
     uscf->peer.init = ngx_http_upstream_init_consistent_replicated_peer;
 
     if (!uscf->servers) {
+        return NGX_ERROR;
+    }
+
+    if (uscf->servers->nelts < usd->replication_level) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "number of peers is less than requested replication_level");
         return NGX_ERROR;
     }
 
@@ -586,9 +642,9 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
     /*  get replication level value of request; by default it equals to
         upstream setting which in turn by default equals to one.
     */
-//    if (usd->repl_var_index < 0) {
+    if (usd->repl_var_index < 0) {
         replication_level = usd->replication_level;
-/*    } else {
+    } else {
         vv = ngx_http_get_indexed_variable(r, usd->repl_var_index);
 
         if (vv == NULL || vv->not_found || vv->len == 0) {
@@ -600,12 +656,16 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
             }
         }
 
-    }*/
+    }
+
+    ucpd->replication_level = replication_level;
+    ucpd->buckets    = ngx_pcalloc(r->pool, sizeof(ngx_uint_t) * ucpd->replication_level);
+ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "repl level for this request is %d", ucpd->replication_level);
 
     // get requested key
     vv = ngx_http_get_indexed_variable(r, usd->req_key_var_index);
     if (vv == NULL || vv->not_found || vv->len == 0) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0,
                       "the \"$consistent_replicated_key\" variable is not set");
         return NGX_ERROR;
     } else {
@@ -623,6 +683,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
     ucpd->hash = ngx_http_upstream_consistent_replicated_hash(ucpd->key, usd);
 
     ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: hash %ui", ucpd->hash);
+ucpd->log = r->connection->log;
 
 
     return NGX_OK;
@@ -644,14 +705,24 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
       done via upstream_keepalive module.
     */
     pc->cached = 0;
-    pc->connection = NULL;
+//    pc->connection = NULL;
 
     if (!peer) {
-        ngx_uint_t bucket = consistent_replicated_find_bucket(usd->continuum, ucpd->hash);
+//        ngx_uint_t bucket = consistent_replicated_find_bucket(usd->continuum, ucpd->hash);
+    consistent_replicated_fill_buckets(ucpd);
+    ngx_uint_t bucket = ucpd->buckets[0];
+
         peer = &usd->peers[ usd->continuum->buckets[bucket].index ];
         peer->addr_index = 0;
 
         ucpd->peer_tries = peer->server->naddrs;
+
+    ngx_uint_t i;
+    for (i = 0; i < ucpd->replication_level; i++) {
+        bucket = ucpd->buckets[i];
+        ngx_log_error(NGX_LOG_EMERG, ucpd->log, 0, "key \"%s\" [%ui] got bucket %ud [%ud]\n", ucpd->key.data, ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
+    }
+
     }
 
     if (peer->server->down) {
@@ -704,7 +775,8 @@ static void ngx_http_upstream_free_consistent_replicated_peer (ngx_peer_connecti
 
         if (--ucpd->peer_tries > 0) {
             // first we should try all addresses of this peer...
-            if (++peer->addr_index == peer->server->naddrs) {
+            ++peer->addr_index;
+            if (peer->addr_index >= peer->server->naddrs) {
                 peer->addr_index = 0;
             }
 
