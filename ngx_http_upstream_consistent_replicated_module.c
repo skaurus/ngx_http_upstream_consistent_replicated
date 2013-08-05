@@ -363,7 +363,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
     }
 
     if (uscf->servers->nelts < usd->replication_level) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "number of peers is less than requested replication_level");
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "number of peers must not be less than default replication level");
         return NGX_ERROR;
     }
 
@@ -652,13 +652,19 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
         } else {
             replication_level = ngx_atoi(vv->data, vv->len);
             if (replication_level == NGX_ERROR || replication_level <= 0) {
+                ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "requested replication level [%s] could not be converted to positive integer", vv->data);
                 return NGX_ERROR;
             }
         }
 
     }
 
-    ucpd->replication_level = replication_level;
+    if (uscf->servers->nelts < (ngx_uint_t) replication_level) {
+        ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "requested replication level [%d] is more than number of peers", (ngx_uint_t) replication_level);
+        return NGX_ERROR;
+    }
+
+    ucpd->replication_level = (ngx_uint_t) replication_level;
     ucpd->buckets    = ngx_pcalloc(r->pool, sizeof(ngx_uint_t) * ucpd->replication_level);
 ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "repl level for this request is %d", ucpd->replication_level);
 
@@ -678,7 +684,7 @@ ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "repl level for this request
 
     ucpd->key = requested_key;
 
-    ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: key \"%V\"", &ucpd->key);
+    ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: key \"%s\"", ucpd->key.data);
 
     ucpd->hash = ngx_http_upstream_consistent_replicated_hash(ucpd->key, usd);
 
@@ -705,7 +711,7 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
       done via upstream_keepalive module.
     */
     pc->cached = 0;
-//    pc->connection = NULL;
+    pc->connection = NULL;
 
     if (!peer) {
 //        ngx_uint_t bucket = consistent_replicated_find_bucket(usd->continuum, ucpd->hash);
