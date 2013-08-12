@@ -158,13 +158,15 @@ static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replica
         }
     }
 
-    /* Wrap around.  */
+    /* Wrap around. */
     if (left == continuum->buckets + continuum->buckets_count) {
         left = continuum->buckets;
     }
 
     return (left - continuum->buckets);
 }
+
+// some service function
 static void consistent_replicated_fill_buckets (ngx_http_upstream_consistent_peer_data_t *ucpd) {
     upstream_consistent_replicated_data_t      *usd       = ucpd->usd;
     upstream_consistent_replicated_continuum_t *continuum = usd->continuum;
@@ -215,7 +217,6 @@ static void consistent_replicated_fill_buckets (ngx_http_upstream_consistent_pee
     return;
 }
 
-
 // some service function
 static ngx_uint_t ngx_http_upstream_consistent_replicated_hash(ngx_str_t key, upstream_consistent_replicated_data_t *usd) {
     ngx_uint_t hash;
@@ -242,6 +243,20 @@ static ngx_uint_t ngx_http_upstream_consistent_replicated_hash(ngx_str_t key, up
     }
 
     return hash;
+}
+
+// comparing two continuum points; for use in qsort
+static int continuum_item_cmp(const void *p1, const void *p2) {
+    upstream_consistent_replicated_continuum_point_t *cp1 = (upstream_consistent_replicated_continuum_point_t *) p1;
+    upstream_consistent_replicated_continuum_point_t *cp2 = (upstream_consistent_replicated_continuum_point_t *) p2;
+
+    if (cp1->point > cp2->point) {
+        return  1;
+    } else if (cp1->point < cp2->point) {
+        return -1;
+    } else {
+        return  0;
+    }
 }
 
 
@@ -403,11 +418,10 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
         if (!usd->continuum->buckets) {
             return NGX_ERROR;
         }
+        usd->continuum->buckets_count = 0;
 
         if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, sizeof(usd->hashing_alg)) == 0 ) {
             // if using Cache::Memcached::Fast logic (based on crc32 hashing)
-
-            usd->continuum->buckets_count = 0;
 
             for (i = 0; i < uscf->servers->nelts; ++i) {
                 static const char delim = '\0';
@@ -508,10 +522,9 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
         } else {
             // if using libketama algorithm (based on md5 hashing)
 
-            // TODO
             for (i = 0; i < uscf->servers->nelts; i++) {
                 float pct = (float) servers[i].weight / (float) usd->total_weight;
-                ngx_uint_t points_per_server = floorf( pct * (float) usd->ketama_points / 4 * (float) uscf->servers->nelts );
+                ngx_uint_t points_per_server = floorf( pct * (float) usd->ketama_points / 4.0 * (float) uscf->servers->nelts );
 
                 for (j = 0; j < points_per_server; j++) {
                     /* 40 hashes, 4 numbers per hash = 160 points per server */
@@ -527,18 +540,27 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
 
                     /* Use successive 4-bytes from hash as numbers 
                      * for the points on the circle: */
-/*                    int h;
-                    for (h = 0; h < 4; h++) {
-                        usd->continuum[cont].point = ( digest[3+h*4] << 24 )
-                                                   | ( digest[2+h*4] << 16 )
-                                                   | ( digest[1+h*4] <<  8 )
-                                                   |   digest[h*4];
+                    int k;
+                    for (k = 0; k < 4; k++) {
+                        usd->continuum->buckets[ usd->continuum->buckets_count ].point =
+                            ( digest[3+k*4] << 24 )
+                          | ( digest[2+k*4] << 16 )
+                          | ( digest[1+k*4] <<  8 )
+                          |   digest[k*4];
+                        usd->continuum->buckets[ usd->continuum->buckets_count ].index = i;
 
-                        memcpy( usd->continuum[cont].ip, slist[i].addr, 22 );
-                        cont++;
-                    }*/
+                        ++usd->continuum->buckets_count;
+                    }
                 }
             }
+
+            // it's an alias to common qsort actually
+            ngx_qsort(
+                usd->continuum->buckets,
+                usd->continuum->buckets_count,
+                sizeof(upstream_consistent_replicated_continuum_point_t),
+                continuum_item_cmp
+            );
 
         }
 
