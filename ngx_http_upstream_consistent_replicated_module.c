@@ -109,8 +109,6 @@ typedef struct {
     ngx_str_t                                       hashing_alg;
     ngx_uint_t                                      peers_count;
     ngx_uint_t                                      total_weight;
-    ngx_int_t                                       repl_var_index;
-    ngx_int_t                                       req_key_var_index;
     upstream_consistent_replicated_peer_addr_t     *peers;
     upstream_consistent_replicated_continuum_t     *continuum;
 } upstream_consistent_replicated_data_t;
@@ -130,14 +128,11 @@ typedef struct {
 
 
 // variables names
-static ngx_str_t replication_level_var  = ngx_string("consistent_replicated_repl_level");
-static ngx_str_t requested_key_var      = ngx_string("consistent_replicated_key");
+static ngx_str_t  REPLICATION_LEVEL_VAR  = ngx_string("consistent_replicated_repl_level");
+static ngx_uint_t REPLICATION_LEVEL_HASH;
+static ngx_str_t  REQUESTED_KEY_VAR      = ngx_string("consistent_replicated_key");
+static ngx_uint_t REQUESTED_KEY_HASH;
 
-// Dummy subroutine to use as var->get_handler; if we don't have one nginx is
-// dying at `ngx_http_variables_init_vars` subroutine.
-static ngx_int_t dummy_variable_get_handler (ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data) {
-    return NGX_OK;
-};
 
 
 // some service function
@@ -323,6 +318,10 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "level %d", replication_level);
     usd->hashing_alg       = hashing_alg;
 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "alg %s", hashing_alg.data);
 
+    // init hashes of our custom variables names
+    REQUESTED_KEY_HASH = ngx_hash_key(REQUESTED_KEY_VAR.data, REQUESTED_KEY_VAR.len);
+    REPLICATION_LEVEL_HASH = ngx_hash_key(REPLICATION_LEVEL_VAR.data, REPLICATION_LEVEL_VAR.len);
+
     // fill upstream servers config
     uscf->peer.data = usd;
 
@@ -353,7 +352,6 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
     ngx_http_upstream_server_t                 *servers;
     ngx_uint_t                                  i, j;
     upstream_consistent_replicated_peer_addr_t *peers;
-    ngx_http_variable_t                        *var;
 
     /* set the callback */
     uscf->peer.init = ngx_http_upstream_init_consistent_replicated_peer;
@@ -386,30 +384,6 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
 
     usd->peers_count = uscf->servers->nelts;
     usd->peers       = peers;
-
-ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "1");
-    /* It's possible to not set `consistent_replicated_repl_level` variable so
-       we are creating here that variable manually with default value.
-    */
-    var = ngx_http_add_variable(cf, &replication_level_var, NGX_HTTP_VAR_CHANGEABLE);
-    var->data = usd->replication_level;
-    /* Without dummy handler I got `unknown "consistent_replicated_repl_level" variable` fatal error.
-       It comes from `ngx_http_variables_init_vars` subroutine.
-    */
-    var->get_handler = dummy_variable_get_handler;
-    // get index of that variable
-    usd->repl_var_index    = ngx_http_get_variable_index(cf, &replication_level_var);
-ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "repl var index %d", usd->repl_var_index);
-    if (usd->repl_var_index == NGX_ERROR) {
-        return NGX_ERROR;
-    }
-
-ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "2");
-    usd->req_key_var_index = ngx_http_get_variable_index(cf, &requested_key_var);
-    if (usd->req_key_var_index == NGX_ERROR) {
-        return NGX_ERROR;
-    }
-ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "3");
 
 
     if (usd->ketama_points > 0) {
@@ -449,7 +423,7 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "3");
                     host += 5;
                     len -= 5;
                 }
-#endif /* NGX_HAVE_UNIX_DOMAIN */
+#endif
 
                 port = host;
                 while (*port) {
@@ -639,24 +613,16 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
     r->upstream->peer.get   = ngx_http_upstream_get_consistent_replicated_peer;
 
 
-    /*  get replication level value of request; by default it equals to
-        upstream setting which in turn by default equals to one.
-    */
-    if (usd->repl_var_index < 0) {
+    // get replication level var (if present)
+    vv = ngx_http_get_variable(r, &REPLICATION_LEVEL_VAR, REPLICATION_LEVEL_HASH);
+    if (vv == NULL || vv->not_found || vv->len == 0) {
         replication_level = usd->replication_level;
     } else {
-        vv = ngx_http_get_indexed_variable(r, usd->repl_var_index);
-
-        if (vv == NULL || vv->not_found || vv->len == 0) {
-            replication_level = usd->replication_level;
-        } else {
-            replication_level = ngx_atoi(vv->data, vv->len);
-            if (replication_level == NGX_ERROR || replication_level <= 0) {
-                ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "requested replication level [%s] could not be converted to positive integer", vv->data);
-                return NGX_ERROR;
-            }
+        replication_level = ngx_atoi(vv->data, vv->len);
+        if (replication_level == NGX_ERROR || replication_level <= 0) {
+            ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "requested replication level [%s] could not be converted to positive integer", vv->data);
+            return NGX_ERROR;
         }
-
     }
 
     if (uscf->servers->nelts < (ngx_uint_t) replication_level) {
@@ -666,13 +632,13 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
 
     ucpd->replication_level = (ngx_uint_t) replication_level;
     ucpd->buckets    = ngx_pcalloc(r->pool, sizeof(ngx_uint_t) * ucpd->replication_level);
-ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "repl level for this request is %d", ucpd->replication_level);
+ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "replication level for this request is %d", ucpd->replication_level);
+
 
     // get requested key
-    vv = ngx_http_get_indexed_variable(r, usd->req_key_var_index);
+    vv = ngx_http_get_variable(r, &REQUESTED_KEY_VAR, REQUESTED_KEY_HASH);
     if (vv == NULL || vv->not_found || vv->len == 0) {
-        ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0,
-                      "the \"$consistent_replicated_key\" variable is not set");
+        ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "the \"$consistent_replicated_key\" variable is not set");
         return NGX_ERROR;
     } else {
         requested_key.data = vv->data;
