@@ -122,7 +122,6 @@ typedef struct {
     ngx_uint_t                                     *buckets;
     upstream_consistent_replicated_peer_addr_t     *peer;
     upstream_consistent_replicated_data_t          *usd;
-    ngx_log_t                                      *log;
 } ngx_http_upstream_consistent_peer_data_t;
 
 
@@ -137,13 +136,13 @@ static ngx_uint_t REQUESTED_KEY_HASH;
 
 // some service function
 static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replicated_continuum_t *continuum, unsigned int point) {
-    upstream_consistent_replicated_continuum_point_t *left, *right;
+    upstream_consistent_replicated_continuum_point_t *left, *right, *middle;
 
     left  = continuum->buckets;
     right = continuum->buckets + continuum->buckets_count;
 
     while (left < right) {
-        upstream_consistent_replicated_continuum_point_t *middle = left + (right - left) / 2;
+        middle = left + (right - left) / 2;
         if (middle->point < point) {
             left = middle + 1;
         } else if (middle->point > point) {
@@ -219,9 +218,9 @@ static void consistent_replicated_fill_buckets (ngx_http_upstream_consistent_pee
 
 // some service function
 static ngx_uint_t ngx_http_upstream_consistent_replicated_hash(ngx_str_t key, upstream_consistent_replicated_data_t *usd) {
-    ngx_uint_t hash;
+    ngx_uint_t hash = 0;
 
-    if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, sizeof(usd->hashing_alg)) == 0 ) {
+    if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, usd->hashing_alg.len) == 0 ) {
         hash = ngx_crc32_long(key.data, key.len);
 
         // don't know what happening here; taken from memcached_hash module.
@@ -236,9 +235,18 @@ static ngx_uint_t ngx_http_upstream_consistent_replicated_hash(ngx_str_t key, up
             hash += 1;
         }
 
-    } else {
-        // TODO
-        hash = 0;
+    } else if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_LIBKETAMA, usd->hashing_alg.len) == 0 ) {
+        unsigned char digest[16];
+
+        ngx_md5_t md5;
+        ngx_md5_init(&md5);
+        ngx_md5_update(&md5, key.data, key.len);
+        ngx_md5_final(digest, &md5);
+
+        hash = ((ngx_uint_t) (digest[3] & 0xFF) << 24)
+             | ((ngx_uint_t) (digest[2] & 0xFF) << 16)
+             | ((ngx_uint_t) (digest[1] & 0xFF) << 8)
+             | ((ngx_uint_t) (digest[0] & 0xFF));
 
     }
 
@@ -327,11 +335,11 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
 
     // fill our config structure with parameters
     usd->ketama_points     = ketama_points;
-ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "ketama %d", ketama_points);
+ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "ketama %d", ketama_points);
     usd->replication_level = replication_level;
-ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "level %d", replication_level);
-    usd->hashing_alg       = hashing_alg;
-ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "alg %s", hashing_alg.data);
+ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "level %d", replication_level);
+        usd->hashing_alg       = hashing_alg;
+ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "alg %s", hashing_alg.data);
 
     // init hashes of our custom variables names
     REQUESTED_KEY_HASH = ngx_hash_key(REQUESTED_KEY_VAR.data, REQUESTED_KEY_VAR.len);
@@ -420,7 +428,7 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
         }
         usd->continuum->buckets_count = 0;
 
-        if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, sizeof(usd->hashing_alg)) == 0 ) {
+        if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, usd->hashing_alg.len) == 0 ) {
             // if using Cache::Memcached::Fast logic (based on crc32 hashing)
 
             for (i = 0; i < uscf->servers->nelts; ++i) {
@@ -519,7 +527,7 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
 
             } // for loop over servers END
 
-        } else {
+        } else if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_LIBKETAMA, usd->hashing_alg.len) == 0 ) {
             // if using libketama algorithm (based on md5 hashing)
 
             for (i = 0; i < uscf->servers->nelts; i++) {
@@ -564,10 +572,12 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
 
         }
 
+
+
     } else {
         // if ketama_points == 0
 
-        if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, sizeof(usd->hashing_alg)) == 0 ) {
+        if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, usd->hashing_alg.len) == 0 ) {
             ngx_uint_t total_weight = 0;
 
             for (i = 0; i < uscf->servers->nelts; ++i) {
@@ -585,17 +595,19 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
 
             usd->continuum->buckets_count = uscf->servers->nelts;
 
-        } else {
+        } else if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_LIBKETAMA, usd->hashing_alg.len) == 0 ) {
             // TODO
 
         }
 
+
+
     }
 
-    for (i = 0; i < usd->continuum->buckets_count; i++) {
+/*    for (i = 0; i < usd->continuum->buckets_count; i++) {
         upstream_consistent_replicated_continuum_point_t bucket = usd->continuum->buckets[i];
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "bucket %ud [%ud]\n", bucket.index, bucket.point);
-    }
+        ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "bucket %ud [%ud]", bucket.index, bucket.point);
+    }*/
 
     return NGX_OK;
 }
@@ -677,7 +689,6 @@ ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "replication level for this 
     ucpd->hash = ngx_http_upstream_consistent_replicated_hash(ucpd->key, usd);
 
     ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: hash %ui", ucpd->hash);
-ucpd->log = r->connection->log;
 
 
     return NGX_OK;
@@ -714,7 +725,7 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
     ngx_uint_t i;
     for (i = 0; i < ucpd->replication_level; i++) {
         bucket = ucpd->buckets[i];
-        ngx_log_error(NGX_LOG_EMERG, ucpd->log, 0, "key \"%s\" [%ui] got bucket %ud [%ud]\n", ucpd->key.data, ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
+        ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "key \"%s\" [%ui] got bucket %ud [%ui]\n", ucpd->key.data, ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
     }
 
     }
