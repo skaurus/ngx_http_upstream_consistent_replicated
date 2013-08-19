@@ -79,11 +79,6 @@ ngx_module_t ngx_http_upstream_consistent_replicated_module = {
 // U is not valid in hex numbers and means that number is unsigned
 #define CONTINUUM_MAX_POINT  0xffffffffU
 
-// allowed ketama alg types (perl one uses crc32, libketama - md5)
-// perl_cmf stands for "Perl Cache::Memcached::Fast module"
-static const char *HASHING_ALG_PERL_CMF  = "perl_cmf";
-static const char *HASHING_ALG_LIBKETAMA = "libketama";
-
 
 typedef struct {
     ngx_http_upstream_server_t                     *server;
@@ -93,8 +88,8 @@ typedef struct {
 } upstream_consistent_replicated_peer_addr_t;
 
 typedef struct {
-    ngx_uint_t                                      point;
-    ngx_uint_t                                      index;
+    ngx_uint_t                                      point; // hash
+    ngx_uint_t                                      index; // index of corresponding server
 } upstream_consistent_replicated_continuum_point_t;
 
 typedef struct {
@@ -106,7 +101,6 @@ typedef struct {
 typedef struct {
     ngx_uint_t                                      ketama_points;
     ngx_uint_t                                      replication_level;
-    ngx_str_t                                       hashing_alg;
     ngx_uint_t                                      peers_count;
     ngx_uint_t                                      total_weight;
     upstream_consistent_replicated_peer_addr_t     *peers;
@@ -218,53 +212,21 @@ static void consistent_replicated_fill_buckets (ngx_http_upstream_consistent_pee
 
 // some service function
 static ngx_uint_t ngx_http_upstream_consistent_replicated_hash(ngx_str_t key, upstream_consistent_replicated_data_t *usd) {
-    ngx_uint_t hash = 0;
+    ngx_uint_t hash = ngx_crc32_long(key.data, key.len);
 
-    if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, usd->hashing_alg.len) == 0 ) {
-        hash = ngx_crc32_long(key.data, key.len);
-
-        // don't know what happening here; taken from memcached_hash module.
-        if (usd->ketama_points == 0) {
-            hash = ((hash >> 16) & 0x00007fffU);
-            hash = hash % usd->total_weight;
-            hash = (uint64_t) hash * CONTINUUM_MAX_POINT;
-            /*
-              Shift point one step forward to possibly get from the
-              border point which belongs to the previous bucket.
-            */
-            hash += 1;
-        }
-
-    } else if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_LIBKETAMA, usd->hashing_alg.len) == 0 ) {
-        unsigned char digest[16];
-
-        ngx_md5_t md5;
-        ngx_md5_init(&md5);
-        ngx_md5_update(&md5, key.data, key.len);
-        ngx_md5_final(digest, &md5);
-
-        hash = ((ngx_uint_t) (digest[3] & 0xFF) << 24)
-             | ((ngx_uint_t) (digest[2] & 0xFF) << 16)
-             | ((ngx_uint_t) (digest[1] & 0xFF) << 8)
-             | ((ngx_uint_t) (digest[0] & 0xFF));
-
+    // don't know what happening here; taken from memcached_hash module.
+    if (usd->ketama_points == 0) {
+        hash = ((hash >> 16) & 0x00007fffU);
+        hash = hash % usd->total_weight;
+        hash = (uint64_t) hash * CONTINUUM_MAX_POINT;
+        /*
+          Shift point one step forward to possibly get from the
+          border point which belongs to the previous bucket.
+        */
+        hash += 1;
     }
 
     return hash;
-}
-
-// comparing two continuum points; for use in qsort
-static int continuum_item_cmp(const void *p1, const void *p2) {
-    upstream_consistent_replicated_continuum_point_t *cp1 = (upstream_consistent_replicated_continuum_point_t *) p1;
-    upstream_consistent_replicated_continuum_point_t *cp2 = (upstream_consistent_replicated_continuum_point_t *) p2;
-
-    if (cp1->point > cp2->point) {
-        return  1;
-    } else if (cp1->point < cp2->point) {
-        return -1;
-    } else {
-        return  0;
-    }
 }
 
 
@@ -285,7 +247,6 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
     uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
 
     int ketama_points = 0, replication_level = 1;
-    ngx_str_t hashing_alg = ngx_string(HASHING_ALG_PERL_CMF);
     unsigned int i;
 
     // let's parse arguments
@@ -310,20 +271,6 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
             continue;
         }
 
-        if (ngx_strncmp(value[i].data, "hashing_alg=", 12) == 0) {
-            ngx_str_t alg = ngx_string(&value[i].data[12]);
-
-            if ( ngx_strncmp(alg.data, HASHING_ALG_PERL_CMF, alg.len + 1) == 0 ) {
-                hashing_alg = alg;
-            } else if ( ngx_strncmp(alg.data, HASHING_ALG_LIBKETAMA, alg.len + 1) == 0 ) {
-                hashing_alg = alg;
-            } else {
-                goto invalid;
-            }
-
-            continue;
-        }
-
         goto invalid;
     }
 
@@ -335,11 +282,7 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
 
     // fill our config structure with parameters
     usd->ketama_points     = ketama_points;
-ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "ketama %d", ketama_points);
     usd->replication_level = replication_level;
-ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "level %d", replication_level);
-        usd->hashing_alg       = hashing_alg;
-ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "alg %s", hashing_alg.data);
 
     // init hashes of our custom variables names
     REQUESTED_KEY_HASH = ngx_hash_key(REQUESTED_KEY_VAR.data, REQUESTED_KEY_VAR.len);
@@ -360,7 +303,7 @@ ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "alg %s", hashing_alg.data);
     return NGX_CONF_OK;
 
 invalid:
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid parameter \"%V\"", &value[i]);
+    ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "invalid parameter \"%V\"", &value[i]);
 
     return NGX_CONF_ERROR;
 }
@@ -403,7 +346,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
         peers[i].server = &servers[i];
         usd->total_weight += servers[i].weight;
     }
-ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
+ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "weight %d", usd->total_weight);
 
     usd->peers_count = uscf->servers->nelts;
     usd->peers       = peers;
@@ -428,186 +371,132 @@ ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight %d", usd->total_weight);
         }
         usd->continuum->buckets_count = 0;
 
-        if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, usd->hashing_alg.len) == 0 ) {
-            // if using Cache::Memcached::Fast logic (based on crc32 hashing)
 
-            for (i = 0; i < uscf->servers->nelts; ++i) {
-                static const char delim = '\0';
-                u_char *host, *port;
-                size_t len, port_len = 0;
-                unsigned int crc32, point, count;
+        for (i = 0; i < uscf->servers->nelts; ++i) {
+            static const char delim = '\0';
+            u_char *host, *port;
+            size_t len, port_len = 0;
+            unsigned int crc32, point, count;
 
-                host = servers[i].addrs[0].name.data;
-                len = servers[i].addrs[0].name.len;
+            host = servers[i].addrs[0].name.data;
+            len = servers[i].addrs[0].name.len;
 
 #if NGX_HAVE_UNIX_DOMAIN
-                if (ngx_strncasecmp(host, (u_char *) "unix:", 5) == 0) {
-                    host += 5;
-                    len -= 5;
-                }
+            if (ngx_strncasecmp(host, (u_char *) "unix:", 5) == 0) {
+                host += 5;
+                len -= 5;
+            }
 #endif
 
-                port = host;
-                while (*port) {
-                    if (*port++ == ':') {
-                        port_len = len - (port - host);
-                        len = (port - host) - 1;
-                        break;
-                    }
-                }
-
-                ngx_crc32_init(crc32);
-                ngx_crc32_update(&crc32, host, len);
-                ngx_crc32_update(&crc32, (u_char *) &delim, 1);
-                ngx_crc32_update(&crc32, port, port_len); 
-
-                point = 0;
-                count = usd->ketama_points * servers[i].weight;
-
-                for (j = 0; j < count; ++j) {
-                    u_char buf[4];
-                    unsigned int new_point = crc32;
-                    ngx_uint_t bucket;
-
-                    /*
-                      We want the same result on all platforms, so we
-                      hardcode size of int as 4 8-bit bytes.
-                    */
-                    buf[0] = point & 0xff;
-                    buf[1] = (point >> 8) & 0xff;
-                    buf[2] = (point >> 16) & 0xff;
-                    buf[3] = (point >> 24) & 0xff;
-
-                    ngx_crc32_update(&new_point, buf, 4);
-                    ngx_crc32_final(new_point);
-                    point = new_point;
-
-                    if (usd->continuum->buckets_count > 0) {
-                        bucket = consistent_replicated_find_bucket(usd->continuum, point);
-
-                        /*
-                          Check if we wrapped around but actually have new
-                          max point.
-                        */
-                        if (bucket == 0 && point > usd->continuum->buckets[0].point) {
-                            bucket = usd->continuum->buckets_count;
-
-                        } else {
-                            /*
-                              Even if there's a server for the same point
-                              already, we have to add ours, because the
-                              first one may be removed later.  But we add
-                              ours after the first server for not to change
-                              key distribution.
-                            */
-                            while (bucket != usd->continuum->buckets_count && usd->continuum->buckets[bucket].point == point) {
-                                ++bucket;
-                            }
-
-                            /* Move the tail one position forward.  */
-                            if (bucket != usd->continuum->buckets_count) {
-                                ngx_memmove(
-                                    usd->continuum->buckets + bucket + 1,
-                                    usd->continuum->buckets + bucket,
-                                    (usd->continuum->buckets_count - bucket) * sizeof(*usd->continuum->buckets)
-                                );
-                            }
-                        }
-
-                    } else {
-                        bucket = 0;
-                    }
-
-                    usd->continuum->buckets[bucket].point = point;
-                    usd->continuum->buckets[bucket].index = i;
-
-                    ++usd->continuum->buckets_count;
-
-                } // for loop over points per server END
-
-            } // for loop over servers END
-
-        } else if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_LIBKETAMA, usd->hashing_alg.len) == 0 ) {
-            // if using libketama algorithm (based on md5 hashing)
-
-            for (i = 0; i < uscf->servers->nelts; i++) {
-                float pct = (float) servers[i].weight / (float) usd->total_weight;
-                ngx_uint_t points_per_server = floorf( pct * (float) usd->ketama_points / 4.0 * (float) uscf->servers->nelts );
-
-                for (j = 0; j < points_per_server; j++) {
-                    /* 40 hashes, 4 numbers per hash = 160 points per server */
-                    char ss[30];
-                    unsigned char digest[16];
-
-                    sprintf(ss, "%s-%d", servers[i].addrs[0].name.data, (int) j);
-
-                    ngx_md5_t md5;
-                    ngx_md5_init(&md5);
-                    ngx_md5_update(&md5, ss, strlen(ss));
-                    ngx_md5_final(digest, &md5);
-
-                    /* Use successive 4-bytes from hash as numbers 
-                     * for the points on the circle: */
-                    int k;
-                    for (k = 0; k < 4; k++) {
-                        usd->continuum->buckets[ usd->continuum->buckets_count ].point =
-                            ( digest[3+k*4] << 24 )
-                          | ( digest[2+k*4] << 16 )
-                          | ( digest[1+k*4] <<  8 )
-                          |   digest[k*4];
-                        usd->continuum->buckets[ usd->continuum->buckets_count ].index = i;
-
-                        ++usd->continuum->buckets_count;
-                    }
+            port = host;
+            while (*port) {
+                if (*port++ == ':') {
+                    port_len = len - (port - host);
+                    len = (port - host) - 1;
+                    break;
                 }
             }
 
-            // it's an alias to common qsort actually
-            ngx_qsort(
-                usd->continuum->buckets,
-                usd->continuum->buckets_count,
-                sizeof(upstream_consistent_replicated_continuum_point_t),
-                continuum_item_cmp
-            );
+            ngx_crc32_init(crc32);
+            ngx_crc32_update(&crc32, host, len);
+            ngx_crc32_update(&crc32, (u_char *) &delim, 1);
+            ngx_crc32_update(&crc32, port, port_len); 
 
-        }
+            point = 0;
+            count = usd->ketama_points * servers[i].weight;
 
+            for (j = 0; j < count; ++j) {
+                u_char buf[4];
+                unsigned int new_point = crc32;
+                ngx_uint_t bucket;
+
+                /*
+                  We want the same result on all platforms, so we
+                  hardcode size of int as 4 8-bit bytes.
+                */
+                buf[0] = point & 0xff;
+                buf[1] = (point >> 8) & 0xff;
+                buf[2] = (point >> 16) & 0xff;
+                buf[3] = (point >> 24) & 0xff;
+
+                ngx_crc32_update(&new_point, buf, 4);
+                ngx_crc32_final(new_point);
+                point = new_point;
+
+                if (usd->continuum->buckets_count > 0) {
+                    bucket = consistent_replicated_find_bucket(usd->continuum, point);
+
+                    /*
+                      Check if we wrapped around but actually have new
+                      max point.
+                    */
+                    if (bucket == 0 && point > usd->continuum->buckets[0].point) {
+                        bucket = usd->continuum->buckets_count;
+
+                    } else {
+                        /*
+                          Even if there's a server for the same point
+                          already, we have to add ours, because the
+                          first one may be removed later.  But we add
+                          ours after the first server for not to change
+                          key distribution.
+                        */
+                        while (bucket != usd->continuum->buckets_count && usd->continuum->buckets[bucket].point == point) {
+                            ++bucket;
+                        }
+
+                        /* Move the tail one position forward.  */
+                        if (bucket != usd->continuum->buckets_count) {
+                            ngx_memmove(
+                                usd->continuum->buckets + bucket + 1,
+                                usd->continuum->buckets + bucket,
+                                (usd->continuum->buckets_count - bucket) * sizeof(*usd->continuum->buckets)
+                            );
+                        }
+                    }
+
+                } else {
+                    bucket = 0;
+
+                }
+
+                usd->continuum->buckets[bucket].point = point;
+                usd->continuum->buckets[bucket].index = i;
+
+                ++usd->continuum->buckets_count;
+
+            } // for loop over points per server END
+
+        } // for loop over servers END
 
 
     } else {
         // if ketama_points == 0
 
-        if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_PERL_CMF, usd->hashing_alg.len) == 0 ) {
-            ngx_uint_t total_weight = 0;
+        ngx_uint_t total_weight = 0;
 
-            for (i = 0; i < uscf->servers->nelts; ++i) {
-                total_weight += servers[i].weight;
+        for (i = 0; i < uscf->servers->nelts; ++i) {
+            total_weight += servers[i].weight;
 
-                for (j = 0; j < i; ++j) {
-                    usd->continuum->buckets[j].point =
-                        (uint64_t) usd->continuum->buckets[j].point
-                        * (total_weight - servers[i].weight) / total_weight;
-                }
-
-                usd->continuum->buckets[i].point = CONTINUUM_MAX_POINT;
-                usd->continuum->buckets[i].index = i;
+            for (j = 0; j < i; ++j) {
+                usd->continuum->buckets[j].point =
+                    (uint64_t) usd->continuum->buckets[j].point
+                    * (total_weight - servers[i].weight) / total_weight;
             }
 
-            usd->continuum->buckets_count = uscf->servers->nelts;
-
-        } else if ( ngx_strncmp(usd->hashing_alg.data, HASHING_ALG_LIBKETAMA, usd->hashing_alg.len) == 0 ) {
-            // TODO
-
+            usd->continuum->buckets[i].point = CONTINUUM_MAX_POINT;
+            usd->continuum->buckets[i].index = i;
         }
 
+        usd->continuum->buckets_count = uscf->servers->nelts;
 
 
     }
 
-/*    for (i = 0; i < usd->continuum->buckets_count; i++) {
+    for (i = 0; i < usd->continuum->buckets_count; i++) {
         upstream_consistent_replicated_continuum_point_t bucket = usd->continuum->buckets[i];
         ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "bucket %ud [%ud]", bucket.index, bucket.point);
-    }*/
+    }
 
     return NGX_OK;
 }
