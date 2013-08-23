@@ -101,9 +101,9 @@ typedef struct {
 typedef struct {
     ngx_uint_t                                      ketama_points;
     ngx_uint_t                                      replication_level;
-    ngx_uint_t                                      peers_count;
     ngx_uint_t                                      total_weight;
     upstream_consistent_replicated_peer_addr_t     *peers;
+    ngx_uint_t                                      peers_count;
     upstream_consistent_replicated_continuum_t     *continuum;
 } upstream_consistent_replicated_data_t;
 
@@ -112,8 +112,10 @@ typedef struct {
     ngx_uint_t                                      hash;
     ngx_str_t                                       key;
     ngx_uint_t                                      peer_tries;
-    ngx_uint_t                                      replication_level;
     ngx_uint_t                                     *buckets;
+    // number of buckets is equal to replication_level; it's like `buckets_count` field
+    ngx_uint_t                                      replication_level;
+    ngx_uint_t                                     peer_index; 
     upstream_consistent_replicated_peer_addr_t     *peer;
     upstream_consistent_replicated_data_t          *usd;
 } ngx_http_upstream_consistent_peer_data_t;
@@ -346,7 +348,6 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
         peers[i].server = &servers[i];
         usd->total_weight += servers[i].weight;
     }
-ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "weight %d", usd->total_weight);
 
     usd->peers_count = uscf->servers->nelts;
     usd->peers       = peers;
@@ -493,10 +494,10 @@ ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "weight %d", usd->total_weight);
 
     }
 
-    for (i = 0; i < usd->continuum->buckets_count; i++) {
+/*    for (i = 0; i < usd->continuum->buckets_count; i++) {
         upstream_consistent_replicated_continuum_point_t bucket = usd->continuum->buckets[i];
         ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "bucket %ud [%ud]", bucket.index, bucket.point);
-    }
+    }*/
 
     return NGX_OK;
 }
@@ -569,15 +570,16 @@ ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "replication level for this 
     }
 
 
+    // how many peers we could try during this request before giving up
     r->upstream->peer.tries = (ngx_uint_t) replication_level;
 
     ucpd->key = requested_key;
 
-    ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: key \"%s\"", ucpd->key.data);
+ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: key \"%s\"", ucpd->key.data);
 
     ucpd->hash = ngx_http_upstream_consistent_replicated_hash(ucpd->key, usd);
 
-    ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: hash %ui", ucpd->hash);
+ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: hash %ui", ucpd->hash);
 
 
     return NGX_OK;
@@ -602,20 +604,22 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
     pc->connection = NULL;
 
     if (!peer) {
-//        ngx_uint_t bucket = consistent_replicated_find_bucket(usd->continuum, ucpd->hash);
-    consistent_replicated_fill_buckets(ucpd);
-    ngx_uint_t bucket = ucpd->buckets[0];
+        consistent_replicated_fill_buckets(ucpd);
+        ngx_uint_t bucket = ucpd->buckets[0];
 
         peer = &usd->peers[ usd->continuum->buckets[bucket].index ];
         peer->addr_index = 0;
 
+        // how many times we will try just THIS peer before giving up
         ucpd->peer_tries = peer->server->naddrs;
 
-    ngx_uint_t i;
-    for (i = 0; i < ucpd->replication_level; i++) {
-        bucket = ucpd->buckets[i];
-        ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "key \"%s\" [%ui] got bucket %ud [%ui]\n", ucpd->key.data, ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
-    }
+        ngx_uint_t i;
+        for (i = 0; i < ucpd->replication_level; i++) {
+            bucket = ucpd->buckets[i];
+            ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "key \"%s\" [%ui] got bucket %ud [%ui]\n", ucpd->key.data, ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
+        }
+
+        
 
     }
 
