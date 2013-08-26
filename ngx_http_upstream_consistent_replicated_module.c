@@ -115,7 +115,7 @@ typedef struct {
     ngx_uint_t                                     *buckets;
     // number of buckets is equal to replication_level; it's like `buckets_count` field
     ngx_uint_t                                      replication_level;
-    ngx_uint_t                                     peer_index; 
+    ngx_uint_t                                      bucket_index;
     upstream_consistent_replicated_peer_addr_t     *peer;
     upstream_consistent_replicated_data_t          *usd;
 } ngx_http_upstream_consistent_peer_data_t;
@@ -595,6 +595,7 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
     upstream_consistent_replicated_data_t      *usd  = ucpd->usd;
     upstream_consistent_replicated_peer_addr_t *peer = ucpd->peer;
     ngx_addr_t                                 *addr;
+    ngx_uint_t                                  bucket;
 
     /*
       I don't really understand why we do this, but maybe the reason is that connection caching is now
@@ -603,36 +604,58 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
     pc->cached = 0;
     pc->connection = NULL;
 
+    // it means that it's a first try to find peer
     if (!peer) {
         consistent_replicated_fill_buckets(ucpd);
-        ngx_uint_t bucket = ucpd->buckets[0];
 
-        peer = &usd->peers[ usd->continuum->buckets[bucket].index ];
-        peer->addr_index = 0;
-
-        // how many times we will try just THIS peer before giving up
-        ucpd->peer_tries = peer->server->naddrs;
+        // actually we can replace `ucpd->bucket_index` with `ucpd->replication_level - pc->tries`,
+        // but things are simpler that way
+        ucpd->bucket_index = 0;
+        pc->tries = ucpd->replication_level;
 
         ngx_uint_t i;
         for (i = 0; i < ucpd->replication_level; i++) {
             bucket = ucpd->buckets[i];
             ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "key \"%s\" [%ui] got bucket %ud [%ui]\n", ucpd->key.data, ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
         }
-
-        
-
     }
 
+begin:
+    bucket = ucpd->buckets[ ucpd->bucket_index ];
+ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "trying bucket index [%d], peer index [%d]", ucpd->bucket_index, usd->continuum->buckets[bucket].index);
+
+    peer = &usd->peers[ usd->continuum->buckets[bucket].index ];
+    peer->addr_index = 0;
+
+    ucpd->peer = peer;
+    // how many times we will try just THIS peer before giving up
+    ucpd->peer_tries = peer->server->naddrs;
+
+
     if (peer->server->down) {
-        goto fail;
+        ++ucpd->bucket_index;
+        if (--pc->tries > 0) {
+ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "peer marked as down, retry.");
+            goto begin;
+        } else {
+            goto fail;
+        }
     }
 
     if (peer->server->max_fails > 0 && peer->fails >= peer->server->max_fails) {
         time_t now = ngx_time();
         if (now - peer->accessed <= peer->server->fail_timeout) {
-            goto fail;
+            ++ucpd->bucket_index;
+            if (--pc->tries > 0) {
+ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "peer temporarily marked as failed, retry.");
+                goto begin;
+            } else {
+                goto fail;
+            }
+
         } else {
             peer->fails = 0;
+
         }
     }
 
@@ -674,23 +697,26 @@ static void ngx_http_upstream_free_consistent_replicated_peer (ngx_peer_connecti
         if (--ucpd->peer_tries > 0) {
             // first we should try all addresses of this peer...
             ++peer->addr_index;
+ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "peer addr No [%d] isn't responding, trying another one.");
+            // shouldn't happen
             if (peer->addr_index >= peer->server->naddrs) {
                 peer->addr_index = 0;
             }
 
         } else {
             // ... then move to the next peer (in case we have replication_level > 1)
+ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "peer isn't responding, trying another one.");
+            ++ucpd->bucket_index;
             --pc->tries;
 
         }
 
-    } else if (state & NGX_PEER_NEXT) {
-        /*
-          If memcached gave negative (NOT_FOUND) reply, there's no need
-          to try the same cache though different address.
-        */
-        pc->tries = 0;
+    } else if ( state & NGX_PEER_NEXT ) {
+ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "peer responded with NOT_FOUND, trying another one.");
+        ++ucpd->bucket_index;
+        --pc->tries;
 
     }
+
 }
 
