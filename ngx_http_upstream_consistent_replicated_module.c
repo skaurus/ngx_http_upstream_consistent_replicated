@@ -605,7 +605,7 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
       done via upstream_keepalive module.
     */
     pc->cached = 0;
-    //pc->connection = NULL; // I need to use pc->connection->pool so I commented out this line. Which purpose I don't understand anyway...
+    pc->connection = NULL;
 
     // it means that it's a first try to find peer
     if (!peer) {
@@ -616,13 +616,9 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
         ucpd->bucket_index = 0;
         pc->tries = ucpd->replication_level;
 
-        ngx_uint_t i;
-        u_char *debug_key = ngx_palloc(pc->connection->pool, ucpd->key.len + 1);
-        ngx_memcpy(debug_key, ucpd->key.data, ucpd->key.len);
-        debug_key[ ucpd->key.len ] = '\0';
         for (i = 0; i < ucpd->replication_level; i++) {
             bucket = ucpd->buckets[i];
-            ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "key \"%s\" [%ui] got bucket %ud [%ui]\n", debug_key, ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
+            ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "hash [%ui] got bucket %ud [%ui]\n", ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
         }
     }
 
