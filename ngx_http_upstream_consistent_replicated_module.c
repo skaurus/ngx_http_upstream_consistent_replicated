@@ -578,7 +578,7 @@ ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "replication level for this 
 u_char *debug_key = ngx_palloc(r->pool, ucpd->key.len + 1);
 ngx_memcpy(debug_key, ucpd->key.data, ucpd->key.len);
 debug_key[ ucpd->key.len ] = '\0';
-ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: key \"%s\"", ucpd->key.len, ucpd->key.data);
+ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "upstream_consistent: key \"%s\"", debug_key);
 
     ucpd->hash = ngx_http_upstream_consistent_replicated_hash(ucpd->key, usd);
 
