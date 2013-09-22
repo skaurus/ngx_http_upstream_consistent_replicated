@@ -616,6 +616,7 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
         ucpd->bucket_index = 0;
         pc->tries = ucpd->replication_level;
 
+        ngx_uint_t i;
         for (i = 0; i < ucpd->replication_level; i++) {
             bucket = ucpd->buckets[i];
             ngx_log_error(NGX_LOG_EMERG, pc->log, 0, "hash [%ui] got bucket %ud [%ui]\n", ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
