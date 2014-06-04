@@ -496,8 +496,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0, "outputting continuum...");
     for (i = 0; i < usd->continuum->buckets_count; i++) {
-        upstream_consistent_replicated_continuum_point_t bucket = usd->continuum->buckets[i];
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, cf->log, 0, "bucket %ud [%ud]", bucket.index, bucket.point);
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, cf->log, 0, "bucket %ud [%ud]", usd->continuum->buckets[i].index, usd->continuum->buckets[i].point);
     }
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0, "continuum output ended");
 
