@@ -6,16 +6,17 @@ Description:
 
 This module uses ketama algorithm to consistently hash requested URI's to backend servers (given that list of servers don't changes).
 Ketama was originally developed for mapping keys to servers in memcache pool.
-It's explanation could be found here: http://www.lastfm.ru/user/RJ/journal/2007/04/10/rz_libketama_-_a_consistent_hashing_algo_for_memcache_clients
+It explanation could be found here: http://www.lastfm.ru/user/RJ/journal/2007/04/10/rz_libketama_-_a_consistent_hashing_algo_for_memcache_clients
 
 There already exists the module that uses ketama exactly for memcache upstreams: https://github.com/dctrwatson/nginx-upstream-consistent
 Using it you could be sure that your backends and Nginx maps keys in the same way.
+But it works only with memcached_pass (key is taken directly from request).
 
-Key difference from that module is that each URI hashes to few backends (hashing to 1 backend is possible, in that case it will be compatible with memcached implementation).
-Each time URI is requested it will be mapped to the same backends (again given that list of servers don't changes).
+This module is more universal - key to hash is passed via variable. Another major difference is that each key could be hashed to few backends (hashing to 1 backend is possible, in that case it will be compatible with memcached implementation).
+Same key always will be mapped to the same backends (again given that list of servers don't changes).
 Mapping to few backends may be useful for example for distributed replicated file storages.
 
-Since Nginx upstream modules can't return few selected backends (which could then be used in something like try_files) this module chooses one of mapped backends randomly.
+Since Nginx upstream modules can't return few selected backends (which could then be used in something like try_files) this module chooses one of mapped backends randomly. But together with proxy_next_upstream this could be configured to try all backends in turn until file is found.
 
 
 Installation:
@@ -52,4 +53,27 @@ upstream backend {
     server 192.168.0.4:9000;
 }
 
+Usage with proxy_next_upstream:
 
+upstream backend {
+    consistent_replicated ketama_points=150 weight_scale=10 replication_level=2;
+    server 192.168.0.2:9000;
+    server 192.168.0.3:9000;
+    server 192.168.0.4:9000;
+}
+
+server {
+    ...
+
+    location /storage {
+        try_files $uri @next;
+    }
+
+    location @next {
+        proxy_set_header            Host            $host;
+        proxy_connect_timeout       3s;
+        proxy_read_timeout          3s;
+        proxy_next_upstream         error timeout invalid_header http_404 http_500 http_502 http_503 http_504;
+        proxy_pass                  http://backend;
+     }
+}
