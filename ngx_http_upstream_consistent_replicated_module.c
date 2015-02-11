@@ -87,22 +87,24 @@ typedef struct {
     ngx_uint_t                                      fails;
 } upstream_consistent_replicated_peer_addr_t;
 
+// ketama bucket
 typedef struct {
-    ngx_uint_t                                      point; // hash
+    ngx_uint_t                                      point; // point on a ketama ring
     ngx_uint_t                                      index; // index of corresponding server
-} upstream_consistent_replicated_continuum_point_t;
+} upstream_consistent_replicated_continuum_bucket_t;
 
+// ketama ring
 typedef struct {
-    upstream_consistent_replicated_continuum_point_t *buckets;
+    upstream_consistent_replicated_continuum_bucket_t *buckets;
     ngx_uint_t                                      buckets_count;
 } upstream_consistent_replicated_continuum_t;
 
-// this structure fills up with data during module init
+// this structure fills up with data during module init (upstream settings)
 typedef struct {
     ngx_uint_t                                      ketama_points;
     ngx_uint_t                                      replication_level;
     ngx_uint_t                                      total_weight;
-    upstream_consistent_replicated_peer_addr_t     *peers;
+    upstream_consistent_replicated_peer_addr_t     *peers;          // upstream servers
     ngx_uint_t                                      peers_count;
     upstream_consistent_replicated_continuum_t     *continuum;
 } upstream_consistent_replicated_data_t;
@@ -130,9 +132,13 @@ static ngx_uint_t REQUESTED_KEY_HASH;
 
 
 
-// some service function
+/*
+    Find a bucket on ketama ring corresponding to requested hash/point.
+    That means - bucket with the nearest point upwards (+ wraparound as always with
+    ketama).
+*/
 static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replicated_continuum_t *continuum, unsigned int point) {
-    upstream_consistent_replicated_continuum_point_t *left, *right, *middle;
+    upstream_consistent_replicated_continuum_bucket_t *left, *right, *middle;
 
     left  = continuum->buckets;
     right = continuum->buckets + continuum->buckets_count;
@@ -144,7 +150,7 @@ static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replica
         } else if (middle->point > point) {
             right = middle;
         } else {
-            /* Find the first point for this value.  */
+            /* Find the first point for this value. */
             while (middle != continuum->buckets && (middle - 1)->point == point) {
                 --middle;
             }
@@ -161,7 +167,12 @@ static ngx_uint_t consistent_replicated_find_bucket (upstream_consistent_replica
     return (left - continuum->buckets);
 }
 
-// some service function
+/*
+    This function founds all buckets - in fact, we interested in servers those
+    buckets point to - where we should be looking for a requested key.
+    It does so by finding first bucket for a key using consistent_replicated_find_bucket
+    and then moving upwards until needed number of unique servers will be found.
+*/
 static void consistent_replicated_fill_buckets (ngx_http_upstream_consistent_peer_data_t *ucpd) {
     upstream_consistent_replicated_data_t      *usd       = ucpd->usd;
     upstream_consistent_replicated_continuum_t *continuum = usd->continuum;
@@ -212,7 +223,7 @@ static void consistent_replicated_fill_buckets (ngx_http_upstream_consistent_pee
     return;
 }
 
-// some service function
+// service function - hash requested key
 static ngx_uint_t ngx_http_upstream_consistent_replicated_hash(ngx_str_t key, upstream_consistent_replicated_data_t *usd) {
     ngx_uint_t hash = ngx_crc32_long(key.data, key.len);
 
@@ -236,7 +247,10 @@ static ngx_uint_t ngx_http_upstream_consistent_replicated_hash(ngx_str_t key, up
 
 /* http://www.evanmiller.org/nginx-modules-guide.html#lb-registration
 
-It registers an upstream initialization function with the surrounding upstream configuration. In addition, the registration function defines which options to the server directive are legal inside this particular upstream block (e.g., weight=, fail_timeout=).
+    It registers an upstream initialization function with the surrounding upstream
+    configuration. In addition, the registration function defines which options to
+    the server directive are legal inside this particular upstream block (e.g.,
+    weight=, fail_timeout=).
 */
 static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     // directive arguments
@@ -295,7 +309,8 @@ static char * ngx_http_upstream_consistent_replicated (ngx_conf_t *cf, ngx_comma
 
     uscf->peer.init_upstream = ngx_http_upstream_init_consistent_replicated;
 
-    uscf->flags = (NGX_HTTP_UPSTREAM_CREATE
+    // options allowed for each server
+    uscf->flags = (NGX_HTTP_UPSTREAM_CREATE         // I guess this flag means we can have servers at all
                  | NGX_HTTP_UPSTREAM_WEIGHT
                  | NGX_HTTP_UPSTREAM_MAX_FAILS
                  | NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
@@ -313,7 +328,8 @@ invalid:
 
 /* http://www.evanmiller.org/nginx-modules-guide.html#lb-upstream
 
-The purpose of the upstream initialization function is to resolve the host names, allocate space for sockets, and assign (yet another) callback.
+    The purpose of the upstream initialization function is to resolve the host
+    names, allocate space for sockets, and assign (yet another) callback.
 */
 static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *uscf) {
     upstream_consistent_replicated_data_t      *usd = uscf->peer.data;
@@ -366,7 +382,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
             buckets_count += usd->ketama_points * servers[i].weight;
         }
 
-        usd->continuum->buckets = ngx_pcalloc(cf->pool, sizeof(upstream_consistent_replicated_continuum_point_t) * buckets_count);
+        usd->continuum->buckets = ngx_pcalloc(cf->pool, sizeof(upstream_consistent_replicated_continuum_bucket_t) * buckets_count);
         if (!usd->continuum->buckets) {
             return NGX_ERROR;
         }
@@ -446,7 +462,7 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
                             ++bucket;
                         }
 
-                        /* Move the tail one position forward.  */
+                        /* Move the tail one position forward. */
                         if (bucket != usd->continuum->buckets_count) {
                             ngx_memmove(
                                 usd->continuum->buckets + bucket + 1,
@@ -506,13 +522,19 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
 
 /* http://www.evanmiller.org/nginx-modules-guide.html#lb-peer
 
-The peer initialization function is called once per request. It sets up a data structure that the module will use as it tries to find an appropriate backend server to service that request; this structure is persistent across backend re-tries, so it's a convenient place to keep track of the number of connection failures, or a computed hash value.
+    The peer initialization function is called once per request. It sets up a
+    data structure that the module will use as it tries to find an appropriate
+    backend server to service that request; this structure is persistent across
+    backend re-tries, so it's a convenient place to keep track of the number of
+    connection failures, or a computed hash value.
 
-In addition, the peer initalization function sets up two callbacks:
-  get: the load-balancing function
-  free: the peer release function (usually just updates some statistics when a connection finishes)
+    In addition, the peer initalization function sets up two callbacks:
+        get:  the load-balancing function
+        free: the peer release function (usually just updates some statistics when
+              a connection finishes)
 
-As if that weren't enough, it also initalizes a variable called tries. As long as tries is positive, nginx will keep retrying this load-balancer.
+    As if that weren't enough, it also initalizes a variable called tries. As long
+    as tries is positive, nginx will keep retrying this load-balancer.
 */
 static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *uscf) {
     // I would rather call that struct request data, but `peer` seems a convention
@@ -592,7 +614,8 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
 
 /* http://www.evanmiller.org/nginx-modules-guide.html#lb-function
 
-It's time for the main course. The real meat and potatoes. This is where the module picks an upstream.
+    It's time for the main course. The real meat and potatoes. This is where the
+    module picks an upstream.
 */ 
 static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data) {
     ngx_http_upstream_consistent_peer_data_t   *ucpd = data;
@@ -678,7 +701,8 @@ fail:
 
 /* http://www.evanmiller.org/nginx-modules-guide.html#lb-release
 
-The peer release function operates after an upstream connection takes place; its purpose is to track failures.
+    The peer release function operates after an upstream connection takes place;
+    its purpose is to  track failures.
 */
 static void ngx_http_upstream_free_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data, ngx_uint_t state) {
     ngx_http_upstream_consistent_peer_data_t   *ucpd = data;
