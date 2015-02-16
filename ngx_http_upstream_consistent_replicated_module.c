@@ -510,11 +510,11 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
 
     }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0, "outputting continuum...");
+    ngx_log_error(NGX_LOG_DEBUG, cf->log, 0, "outputting continuum...");
     for (i = 0; i < usd->continuum->buckets_count; i++) {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, cf->log, 0, "bucket %ud [%ud]", usd->continuum->buckets[i].index, usd->continuum->buckets[i].point);
+        ngx_log_error(NGX_LOG_DEBUG, cf->log, 0, "bucket %ud [%ud]", usd->continuum->buckets[i].index, usd->continuum->buckets[i].point);
     }
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0, "continuum output ended");
+    ngx_log_error(NGX_LOG_DEBUG, cf->log, 0, "continuum output ended");
 
     return NGX_OK;
 }
@@ -567,25 +567,25 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
     } else {
         replication_level = ngx_atoi(vv->data, vv->len);
         if (replication_level == NGX_ERROR || replication_level <= 0) {
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "requested replication level [%s] could not be converted to positive integer", vv->data);
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "requested replication level [%s] could not be converted to positive integer", vv->data);
             return NGX_ERROR;
         }
     }
 
     if (uscf->servers->nelts < (ngx_uint_t) replication_level) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "requested replication level [%d] is more than number of peers", (ngx_uint_t) replication_level);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "requested replication level [%d] is more than number of peers", (ngx_uint_t) replication_level);
         return NGX_ERROR;
     }
 
     ucpd->replication_level = (ngx_uint_t) replication_level;
     ucpd->buckets    = ngx_pcalloc(r->pool, sizeof(ngx_uint_t) * ucpd->replication_level);
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "replication level for this request is %d", ucpd->replication_level);
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "replication level for this request is %d", ucpd->replication_level);
 
 
     // get requested key
     vv = ngx_http_get_variable(r, &REQUESTED_KEY_VAR, REQUESTED_KEY_HASH);
     if (vv == NULL || vv->not_found || vv->len == 0) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "the \"$consistent_replicated_key\" variable is not set");
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "the \"$consistent_replicated_key\" variable is not set");
         return NGX_ERROR;
     } else {
         requested_key.data = vv->data;
@@ -601,11 +601,11 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated_peer (ngx_http_req
     u_char *debug_key = ngx_palloc(r->pool, ucpd->key.len + 1);
     ngx_memcpy(debug_key, ucpd->key.data, ucpd->key.len);
     debug_key[ ucpd->key.len ] = '\0';
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "upstream_consistent: key \"%s\"", debug_key);
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "upstream_consistent: key \"%s\"", debug_key);
 
     ucpd->hash = ngx_http_upstream_consistent_replicated_hash(ucpd->key, usd);
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "upstream_consistent: hash %ui", ucpd->hash);
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "upstream_consistent: hash %ui", ucpd->hash);
 
 
     return NGX_OK;
@@ -643,13 +643,13 @@ static ngx_int_t ngx_http_upstream_get_consistent_replicated_peer (ngx_peer_conn
         ngx_uint_t i;
         for (i = 0; i < ucpd->replication_level; i++) {
             bucket = ucpd->buckets[i];
-            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "hash [%ui] got bucket %ud [%ui]\n", ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
+            ngx_log_error(NGX_LOG_INFO, pc->log, 0, "hash [%ui] got bucket %ud [%ui]\n", ucpd->hash, usd->continuum->buckets[bucket].index, usd->continuum->buckets[bucket].point);
         }
     }
 
 begin:
     bucket = ucpd->buckets[ ucpd->bucket_index ];
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "trying bucket index [%d], peer index [%d]", ucpd->bucket_index, usd->continuum->buckets[bucket].index);
+    ngx_log_error(NGX_LOG_INFO, pc->log, 0, "trying bucket index [%d], peer index [%d]", ucpd->bucket_index, usd->continuum->buckets[bucket].index);
 
     peer = &usd->peers[ usd->continuum->buckets[bucket].index ];
     peer->addr_index = 0;
@@ -662,7 +662,7 @@ begin:
     if (peer->server->down) {
         ++ucpd->bucket_index;
         if (--pc->tries > 0) {
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer marked as down, retry.");
+            ngx_log_error(NGX_LOG_INFO, pc->log, 0, "peer marked as down, retry.");
             goto begin;
         } else {
             goto fail;
@@ -674,7 +674,7 @@ begin:
         if (now - peer->accessed <= peer->server->fail_timeout) {
             ++ucpd->bucket_index;
             if (--pc->tries > 0) {
-                ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer temporarily marked as failed, retry.");
+                ngx_log_error(NGX_LOG_INFO, pc->log, 0, "peer temporarily marked as failed, retry.");
                 goto begin;
             } else {
                 goto fail;
@@ -725,7 +725,7 @@ static void ngx_http_upstream_free_consistent_replicated_peer (ngx_peer_connecti
         if (--ucpd->peer_tries > 0) {
             // first we should try all addresses of this peer...
             ++peer->addr_index;
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer addr No [%d] isn't responding, trying another one.");
+            ngx_log_error(NGX_LOG_INFO, pc->log, 0, "peer addr No [%d] isn't responding, trying another one.");
             // shouldn't happen
             if (peer->addr_index >= peer->server->naddrs) {
                 peer->addr_index = 0;
@@ -733,14 +733,14 @@ static void ngx_http_upstream_free_consistent_replicated_peer (ngx_peer_connecti
 
         } else {
             // ... then move to the next peer (in case we have replication_level > 1)
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer isn't responding, trying another one.");
+            ngx_log_error(NGX_LOG_INFO, pc->log, 0, "peer isn't responding, trying another one.");
             ++ucpd->bucket_index;
             --pc->tries;
 
         }
 
     } else if ( state & NGX_PEER_NEXT ) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer responded with NOT_FOUND, trying another one.");
+        ngx_log_error(NGX_LOG_INFO, pc->log, 0, "peer responded with NOT_FOUND, trying another one.");
         ++ucpd->bucket_index;
         --pc->tries;
 
