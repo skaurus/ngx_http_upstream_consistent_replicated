@@ -510,11 +510,17 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
 
     }
 
-    ngx_log_error(NGX_LOG_DEBUG, cf->log, 0, "outputting continuum...");
+/*
+    // I haven't found a way to turn on/off this logging via nginx config,
+    // because there is no known to me way to change cf->log->log_level (NGX_LOG_INFO
+    // by default). So it's either totally on (and will warn on each restart) either
+    // totally off (commented out).
+    ngx_log_error(NGX_LOG_INFO, cf->log, 0, "outputting continuum...");
     for (i = 0; i < usd->continuum->buckets_count; i++) {
-        ngx_log_error(NGX_LOG_DEBUG, cf->log, 0, "bucket %ud [%ud]", usd->continuum->buckets[i].index, usd->continuum->buckets[i].point);
+        ngx_log_error(NGX_LOG_INFO, cf->log, 0, "bucket %ud [%ud]", usd->continuum->buckets[i].index, usd->continuum->buckets[i].point);
     }
-    ngx_log_error(NGX_LOG_DEBUG, cf->log, 0, "continuum output ended");
+    ngx_log_error(NGX_LOG_INFO, cf->log, 0, "continuum output ended");
+*/
 
     return NGX_OK;
 }
@@ -702,7 +708,7 @@ fail:
 /* http://www.evanmiller.org/nginx-modules-guide.html#lb-release
 
     The peer release function operates after an upstream connection takes place;
-    its purpose is to  track failures.
+    its purpose is to track failures.
 */
 static void ngx_http_upstream_free_consistent_replicated_peer (ngx_peer_connection_t *pc, void *data, ngx_uint_t state) {
     ngx_http_upstream_consistent_peer_data_t   *ucpd = data;
