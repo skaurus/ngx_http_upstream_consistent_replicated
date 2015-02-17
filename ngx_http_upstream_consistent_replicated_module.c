@@ -395,8 +395,8 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
             size_t len, port_len = 0;
             unsigned int crc32, point, count;
 
-            host = servers[i].addrs[0].name.data;
-            len = servers[i].addrs[0].name.len;
+            host = servers[i].name.data;
+            len = servers[i].name.len;
 
 #if NGX_HAVE_UNIX_DOMAIN
             if (ngx_strncasecmp(host, (u_char *) "unix:", 5) == 0) {
@@ -412,6 +412,13 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
                     len = (port - host) - 1;
                     break;
                 }
+            }
+            
+            // `port is 80 by default` makes this imcompatible with Cache::Memcached::Fast...
+            // unless (any) port is set explicitly of course.
+            if (! *port) {
+                port = (u_char *) "80";
+                port_len = 2;
             }
 
             ngx_crc32_init(crc32);
