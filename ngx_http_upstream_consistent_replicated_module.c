@@ -413,13 +413,6 @@ static ngx_int_t ngx_http_upstream_init_consistent_replicated (ngx_conf_t *cf, n
                     break;
                 }
             }
-            
-            // `port is 80 by default` makes this imcompatible with Cache::Memcached::Fast...
-            // unless (any) port is set explicitly of course.
-            if (! *port) {
-                port = (u_char *) "80";
-                port_len = 2;
-            }
 
             ngx_crc32_init(crc32);
             ngx_crc32_update(&crc32, host, len);
