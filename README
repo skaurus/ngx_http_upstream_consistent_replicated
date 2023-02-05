@@ -4,19 +4,19 @@ Nginx Upstream Ketama-based Consistent Replicated Balancer
 Description:
 --
 
-This module uses ketama algorithm to consistently hash requested URI's to backend servers (given that list of servers don't changes).
-Ketama was originally developed for mapping keys to servers in memcache pool.
-It explanation could be found here: http://www.lastfm.ru/user/RJ/journal/2007/04/10/rz_libketama_-_a_consistent_hashing_algo_for_memcache_clients
+This module uses ketama algorithm to consistently hash requested URI's to backend servers (given that list of servers don't change).
+Ketama was originally developed for mapping keys to servers in a memcache pool.
+Its  explanation could be found here: http://www.lastfm.ru/user/RJ/journal/2007/04/10/rz_libketama_-_a_consistent_hashing_algo_for_memcache_clients
 
-There already exists the module that uses ketama exactly for memcache upstreams: https://github.com/dctrwatson/nginx-upstream-consistent
+There is already exists the module that uses ketama exactly for memcache upstreams: https://github.com/dctrwatson/nginx-upstream-consistent
 Using it you could be sure that your backends and Nginx maps keys in the same way.
 But it works only with memcached_pass (key is taken directly from request).
 
 This module is more universal - key to hash is passed via variable. Another major difference is that each key could be hashed to few backends (hashing to 1 backend is possible, in that case it will be compatible with memcached implementation).
-Same key always will be mapped to the same backends (again given that list of servers don't changes).
-Mapping to few backends may be useful for example for distributed replicated file storages.
+Same key always will be mapped to the same backends (again given that list of servers don't change).
+Mapping to a few backends may be useful, for example, to achieve high-availability.
 
-Since Nginx upstream modules can't return few selected backends (which could then be used in something like try_files) this module chooses one of mapped backends randomly. But together with proxy_next_upstream this could be configured to try all backends in turn until file is found.
+Since Nginx upstream modules can't return few selected backends (which could then be used in something like try_files) this module chooses one of mapped backends randomly. But together with proxy_next_upstream this could be configured to try all backends in turn until we get a successful response.
 
 
 Installation:
@@ -44,7 +44,7 @@ upstream backend {
 }
 
 Also it may accept parameters ketama_points, weight_scale and replication_level.
-By default they are respectively 150, 10 and 1 and thus should be compatible with Perl Cache::Memcached::Fast module.
+By default they are respectively 150, 10 and 1 and thus should be compatible with Perl's Cache::Memcached::Fast module.
 
 upstream backend {
     consistent_replicated ketama_points=150 weight_scale=10 replication_level=1;
